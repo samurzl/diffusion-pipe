@@ -38,7 +38,8 @@ transformer_dtype = 'float8'
 timestep_sample_method = 'logit_normal'
 
 [adapter]
-type = 'lora'
+# Set type to 'lora', 'dora', or 'lokr' for different PEFT approaches.
+type = 'dora'
 rank = 32
 dtype = 'bfloat16'
 

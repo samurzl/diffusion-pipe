@@ -178,7 +178,24 @@ class BasePipeline:
                 lora_alpha=adapter_config['alpha'],
                 lora_dropout=adapter_config['dropout'],
                 bias='none',
-                target_modules=target_linear_modules
+                target_modules=target_linear_modules,
+            )
+        elif adapter_type == 'dora':
+            peft_config = peft.LoraConfig(
+                r=adapter_config['rank'],
+                lora_alpha=adapter_config['alpha'],
+                lora_dropout=adapter_config['dropout'],
+                bias='none',
+                target_modules=target_linear_modules,
+                use_dora=True,
+            )
+        elif adapter_type == 'lokr':
+            peft_config = peft.LoKrConfig(
+                r=adapter_config['rank'],
+                alpha=adapter_config['alpha'],
+                rank_dropout=adapter_config.get('dropout', 0.0),
+                module_dropout=adapter_config.get('module_dropout', 0.0),
+                target_modules=target_linear_modules,
             )
         else:
             raise NotImplementedError(f'Adapter type {adapter_type} is not implemented')
@@ -204,19 +221,27 @@ class BasePipeline:
             raise RuntimeError(f'Multiple safetensors files found in {adapter_path}')
         adapter_state_dict = safetensors.torch.load_file(safetensors_files[0])
         modified_state_dict = {}
-        model_parameters = set(name for name, p in self.transformer.named_parameters())
+        model_parameters = {name for name, _ in self.transformer.named_parameters()}
         for k, v in adapter_state_dict.items():
             # Replace Diffusers or ComfyUI prefix
             k = re.sub(r'^(transformer|diffusion_model)\.', '', k)
-            # Replace weight at end for LoRA format
-            k = re.sub(r'\.weight$', '.default.weight', k)
-            if k not in model_parameters:
-                raise RuntimeError(f'modified_state_dict key {k} is not in the model parameters')
-            modified_state_dict[k] = v
+            # Try standard LoRA naming first
+            key = re.sub(r'\.weight$', '.default.weight', k)
+            if key not in model_parameters:
+                # If there's no ".weight" key, try adding just ".default" for
+                # adapter types like LoKr whose params don't end with weight
+                alt_key = f"{k}.default"
+                if alt_key in model_parameters:
+                    key = alt_key
+                elif k in model_parameters:
+                    key = k
+                else:
+                    raise RuntimeError(f'modified_state_dict key {k} is not in the model parameters')
+            modified_state_dict[key] = v
         self.transformer.load_state_dict(modified_state_dict, strict=False)
 
     def load_and_fuse_adapter(self, path):
-        peft_config = peft.LoraConfig.from_pretrained(path)
+        peft_config = peft.PeftConfig.from_pretrained(path)
         lora_model = peft.get_peft_model(self.transformer, peft_config)
         self.load_adapter_weights(path)
         lora_model.merge_and_unload()
