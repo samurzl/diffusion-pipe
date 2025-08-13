@@ -110,12 +110,12 @@ def set_config_defaults(config):
     if 'adapter' in config:
         adapter_config = config['adapter']
         adapter_type = adapter_config['type']
-        if adapter_config['type'] == 'lora':
-            if 'alpha' in adapter_config:
+        if adapter_type in ('lora', 'dora', 'lokr'):
+            if adapter_type != 'lokr' and 'alpha' in adapter_config:
                 raise NotImplementedError(
-                    'This script forces alpha=rank to make the saved LoRA format simpler and more predictable with downstream inference programs. Please remove alpha from the config.'
+                    'This script forces alpha=rank to make the saved adapter format simpler and more predictable with downstream inference programs. Please remove alpha from the config.'
                 )
-            adapter_config['alpha'] = adapter_config['rank']
+            adapter_config.setdefault('alpha', adapter_config['rank'])
             adapter_config.setdefault('dropout', 0.0)
             adapter_config.setdefault('dtype', model_dtype_str)
             adapter_config['dtype'] = DTYPE_MAP[adapter_config['dtype']]
