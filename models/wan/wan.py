@@ -209,6 +209,23 @@ class WanPipeline(BasePipeline):
                 tokenizer_path=ckpt_dir / wan_config.clip_tokenizer,
             )
 
+    def configure_adapter(self, adapter_config, target_linear_modules=None):
+        part = adapter_config.get('target_parts', 'all')
+        if target_linear_modules is None:
+            target_linear_modules = set()
+            for name, module in self.transformer.named_modules():
+                if module.__class__.__name__ not in self.adapter_target_modules:
+                    continue
+                for full_submodule_name, submodule in module.named_modules(prefix=name):
+                    if not isinstance(submodule, nn.Linear):
+                        continue
+                    if part == 'temporal' and '.self_attn.' not in full_submodule_name:
+                        continue
+                    if part == 'spatial' and '.self_attn.' in full_submodule_name:
+                        continue
+                    target_linear_modules.add(full_submodule_name)
+        return super().configure_adapter(adapter_config, target_linear_modules)
+
     # delay loading transformer to save RAM
     def load_diffusion_model(self):
         dtype = self.model_config['dtype']
