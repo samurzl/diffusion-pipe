@@ -42,6 +42,8 @@ timestep_sample_method = 'logit_normal'
 type = 'dora'
 rank = 32
 dtype = 'bfloat16'
+# Optionally limit LoRA to only 'temporal' or 'spatial' modules.
+# target_parts = 'temporal'
 
 [optimizer]
 type = 'AdamW8bitKahan'

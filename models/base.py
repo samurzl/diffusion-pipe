@@ -161,14 +161,15 @@ class BasePipeline:
     def get_text_encoders(self):
         raise NotImplementedError()
 
-    def configure_adapter(self, adapter_config):
-        target_linear_modules = set()
-        for name, module in self.transformer.named_modules():
-            if module.__class__.__name__ not in self.adapter_target_modules:
-                continue
-            for full_submodule_name, submodule in module.named_modules(prefix=name):
-                if isinstance(submodule, nn.Linear):
-                    target_linear_modules.add(full_submodule_name)
+    def configure_adapter(self, adapter_config, target_linear_modules=None):
+        if target_linear_modules is None:
+            target_linear_modules = set()
+            for name, module in self.transformer.named_modules():
+                if module.__class__.__name__ not in self.adapter_target_modules:
+                    continue
+                for full_submodule_name, submodule in module.named_modules(prefix=name):
+                    if isinstance(submodule, nn.Linear):
+                        target_linear_modules.add(full_submodule_name)
         target_linear_modules = list(target_linear_modules)
 
         adapter_type = adapter_config['type']
