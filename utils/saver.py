@@ -17,8 +17,12 @@ def convert_state_dict_dtype(state_dict, dtype):
 
 
 last_checkpoint_time = None
-def need_to_checkpoint(config, epoch=None):
+def need_to_checkpoint(config, epoch=None, step=None):
     global last_checkpoint_time
+
+    if step is not None:
+        if 'checkpoint_every_n_steps' in config and step % config['checkpoint_every_n_steps'] == 0:
+            return True
 
     if epoch is not None:
         if 'checkpoint_every_n_epochs' in config and epoch % config['checkpoint_every_n_epochs'] == 0:
@@ -163,7 +167,7 @@ class Saver:
         if 'save_every_n_steps' in self.config and step % self.config['save_every_n_steps'] == 0:
             self.save_model(f'step{step}')
 
-        if need_to_checkpoint(self.config) or should_manually_save:
+        if need_to_checkpoint(self.config, step=step) or should_manually_save:
             self.save_checkpoint(step)
 
         if should_manually_quit:

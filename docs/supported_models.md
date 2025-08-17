@@ -184,7 +184,7 @@ You still need ckpt_path, it's just that it can be missing the transformer files
 
 For i2v training, you **MUST** train on a dataset of only videos. The training script will crash with an error otherwise. The first frame of each video clip is used as the image conditioning, and the model is trained to predict the rest of the video. Please pay attention to the video_clip_mode setting. It defaults to 'single_beginning' if unset, which is reasonable for i2v training, but if you set it to something else during t2v training it may not be what you want for i2v. Only the 14B model has an i2v variant, and it requires training on videos, so VRAM requirements are high. Use block swapping as needed if you don't have enough VRAM.
 
-Training can optionally apply data augmentations to video clips. Add an `[augmentations]` section to your config with options such as `horizontal_flip_prob` or `color_jitter` to control this behaviour. All frames in a clip receive the same random transform.
+Training can optionally apply data augmentations to video clips. Add an `[augmentations]` section to your config with options such as `horizontal_flip_prob`, `vertical_flip_prob`, `rotation`, `gaussian_blur`, or `color_jitter` to control this behaviour. All frames in a clip receive the same random transform.
 
 Wan2.1 LoRAs are saved in ComfyUI format.
 

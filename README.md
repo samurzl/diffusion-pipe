@@ -13,6 +13,8 @@ Models supported: SDXL, Flux, LTX-Video, HunyuanVideo (t2v), Cosmos, Lumina Imag
 - Easily add new models by implementing a single subclass
 
 ## Recent changes
+- 2025-08-08
+  - Add additional data augmentation options and allow checkpointing every n steps.
 - 2025-08-07
   - Fix Flux training error caused by a breaking change in Diffusers. Make sure to update requirements.
 - 2025-08-06
