@@ -1,6 +1,7 @@
 from pathlib import Path
 import re
 import tarfile
+import random
 
 import peft
 import torch
@@ -10,6 +11,7 @@ import safetensors.torch
 import torchvision
 from PIL import Image, ImageOps
 from torchvision import transforms
+from torchvision.transforms import functional as TF
 import imageio
 
 from utils.common import is_main_process, VIDEO_EXTENSIONS, round_to_nearest_multiple, round_down_to_multiple
@@ -74,6 +76,15 @@ class PreprocessMediaFile:
             assert self.framerate
         self.tarfile_map = {}
 
+        # augmentation settings
+        self.enable_augment = config.get('augmentation_enable', False)
+        self.rotation_degrees = config.get('augmentation_rotation_deg', 5)
+        self.zoom_scale = config.get('augmentation_zoom', 0.05)
+        self.zoom_motion_prob = config.get('augmentation_zoom_motion_prob', 0.0)
+        self.zoom_motion_scale = config.get('augmentation_zoom_motion_scale', self.zoom_scale)
+        self.frame_drop_prob = config.get('augmentation_frame_drop_prob', 0.0)
+        self.hflip_prob = config.get('augmentation_hflip_prob', 0.0)
+
     def __del__(self):
         for tar_f in self.tarfile_map.values():
             tar_f.close()
@@ -112,6 +123,19 @@ class PreprocessMediaFile:
         frames_rounded = round_down_to_multiple(size_bucket_frames - 1, self.round_frames) + 1
         resize_wh = (width_rounded, height_rounded)
 
+        if self.enable_augment:
+            angle = random.uniform(-self.rotation_degrees, self.rotation_degrees)
+            base_scale = 1 + random.uniform(-self.zoom_scale, self.zoom_scale)
+            do_flip = random.random() < self.hflip_prob
+            do_zoom_motion = self.support_video and num_frames > 1 and random.random() < self.zoom_motion_prob
+            zoom_direction = random.choice(['in', 'out']) if do_zoom_motion else None
+        else:
+            angle = 0
+            base_scale = 1
+            do_flip = False
+            do_zoom_motion = False
+            zoom_direction = None
+
         if mask_filepath:
             mask_img = Image.open(mask_filepath).convert('RGB')
             img_hw = (height, width)
@@ -130,9 +154,36 @@ class PreprocessMediaFile:
         resized_video = torch.empty((num_frames, 3, height_rounded, width_rounded))
         for i, frame in enumerate(video):
             if not isinstance(frame, Image.Image):
-                frame = torchvision.transforms.functional.to_pil_image(frame)
+                frame = TF.to_pil_image(frame)
             cropped_image = convert_crop_and_resize(frame, resize_wh)
+            if self.enable_augment:
+                motion_scale = 1.0
+                if do_zoom_motion and zoom_direction is not None:
+                    progress = i / max(num_frames - 1, 1)
+                    if zoom_direction == 'in':
+                        motion_scale = 1 + self.zoom_motion_scale * progress
+                    else:
+                        motion_scale = 1 + self.zoom_motion_scale * (1 - progress)
+                total_scale = base_scale * motion_scale
+                cropped_image = TF.affine(
+                    cropped_image,
+                    angle=angle,
+                    translate=(0, 0),
+                    scale=total_scale,
+                    shear=(0, 0),
+                )
+                if do_flip:
+                    cropped_image = TF.hflip(cropped_image)
             resized_video[i, ...] = self.pil_to_tensor(cropped_image)
+
+        if (
+            self.support_video
+            and self.enable_augment
+            and num_frames > 1
+            and random.random() < self.frame_drop_prob
+        ):
+            resized_video = resized_video[::2]
+            resized_video = resized_video.repeat_interleave(2, dim=0)[:num_frames]
 
         if hasattr(filepath_or_file, 'close'):
             filepath_or_file.close()

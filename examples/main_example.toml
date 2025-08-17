@@ -96,6 +96,22 @@ steps_per_print = 1
 # default is single_beginning
 video_clip_mode = 'single_beginning'
 
+# Augmentation settings for preprocessing media files. All are optional.
+# Set `augmentation_enable = true` to enable the augmentations below.
+# augmentation_enable = true
+# Random rotation range in degrees.
+# augmentation_rotation_deg = 5
+# Random zoom range as a fraction (0.05 = +/-5%).
+# augmentation_zoom = 0.05
+# Probability of applying progressive zoom in/out motion across frames.
+# augmentation_zoom_motion_prob = 0.0
+# Maximum additional zoom used for zoom motion.
+# augmentation_zoom_motion_scale = 0.05
+# Probability of dropping every other frame and duplicating remaining frames.
+# augmentation_frame_drop_prob = 0.0
+# Probability of horizontally flipping clips.
+# augmentation_hflip_prob = 0.0
+
 # This is how you configure HunyuanVideo. Other models will be different. See docs/supported_models.md for
 # details on the configuration and options for each model.
 [model]
