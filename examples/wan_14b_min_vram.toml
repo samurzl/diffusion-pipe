@@ -30,6 +30,12 @@ steps_per_print = 1
 video_clip_mode = 'single_beginning'
 blocks_to_swap = 32
 
+[augmentations]
+# Probability of horizontally flipping an entire video clip
+horizontal_flip_prob = 0.5
+# Optional color jitter augmentation
+color_jitter = {brightness = 0.1, contrast = 0.1, saturation = 0.1, hue = 0.05}
+
 [model]
 type = 'wan'
 ckpt_path = '/data2/imagegen_models/Wan2.1-T2V-14B'
