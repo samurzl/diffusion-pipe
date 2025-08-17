@@ -54,7 +54,9 @@ eval_gradient_accumulation_steps = 1
 
 # Probably want to set this a bit higher if you have a smaller dataset so you don't end up with a million saved models.
 save_every_n_epochs = 2
-# Can checkpoint the training state every n number of epochs or minutes. Set only one of these. You can resume from checkpoints using the --resume_from_checkpoint flag.
+# Can checkpoint the training state every n number of steps, epochs, or minutes. Set only one of these.
+# You can resume from checkpoints using the --resume_from_checkpoint flag.
+#checkpoint_every_n_steps = 500
 #checkpoint_every_n_epochs = 1
 checkpoint_every_n_minutes = 120
 # Always set to true unless you have a huge amount of VRAM.
@@ -95,6 +97,14 @@ steps_per_print = 1
 # multiple_overlapping: extract the minimum number of clips to cover the full range of the video. They might overlap some.
 # default is single_beginning
 video_clip_mode = 'single_beginning'
+
+# Example data augmentations. All frames in a clip receive the same transform.
+# [augmentations]
+# horizontal_flip_prob = 0.5
+# vertical_flip_prob = 0.2
+# rotation = {degrees = 10, prob = 0.3}
+# gaussian_blur = {sigma_min = 0.1, sigma_max = 2.0, prob = 0.2}
+# color_jitter = {brightness = 0.1, contrast = 0.1, saturation = 0.1, hue = 0.05}
 
 # This is how you configure HunyuanVideo. Other models will be different. See docs/supported_models.md for
 # details on the configuration and options for each model.

@@ -8,7 +8,7 @@ from torch import nn
 import torch.nn.functional as F
 import safetensors.torch
 import torchvision
-from PIL import Image, ImageOps
+from PIL import Image, ImageOps, ImageFilter
 from torchvision import transforms
 import imageio
 import random
@@ -78,6 +78,25 @@ class PreprocessMediaFile:
 
         aug_cfg = config.get('augmentations', {})
         self.flip_prob = aug_cfg.get('horizontal_flip_prob', 0.0)
+        self.vflip_prob = aug_cfg.get('vertical_flip_prob', 0.0)
+
+        rot_cfg = aug_cfg.get('rotation', None)
+        if rot_cfg:
+            self.rot_degrees = rot_cfg.get('degrees', 0.0)
+            self.rot_prob = rot_cfg.get('prob', 0.0)
+            self.use_rotation = self.rot_degrees > 0 and self.rot_prob > 0
+        else:
+            self.use_rotation = False
+
+        gb_cfg = aug_cfg.get('gaussian_blur', None)
+        if gb_cfg:
+            self.gb_sigma_min = gb_cfg.get('sigma_min', 0.1)
+            self.gb_sigma_max = gb_cfg.get('sigma_max', 2.0)
+            self.gb_prob = gb_cfg.get('prob', 0.0)
+            self.use_gaussian_blur = self.gb_prob > 0
+        else:
+            self.use_gaussian_blur = False
+
         cj_cfg = aug_cfg.get('color_jitter', None)
         if cj_cfg:
             self.cj_brightness = cj_cfg.get('brightness', 0.0)
@@ -127,6 +146,13 @@ class PreprocessMediaFile:
         resize_wh = (width_rounded, height_rounded)
 
         do_flip = self.flip_prob > 0 and random.random() < self.flip_prob
+        do_vflip = self.vflip_prob > 0 and random.random() < self.vflip_prob
+        do_rotate = self.use_rotation and random.random() < self.rot_prob
+        if do_rotate:
+            rot_angle = random.uniform(-self.rot_degrees, self.rot_degrees)
+        do_blur = self.use_gaussian_blur and random.random() < self.gb_prob
+        if do_blur:
+            blur_sigma = random.uniform(self.gb_sigma_min, self.gb_sigma_max)
         if self.use_color_jitter:
             b = [max(0, 1 - self.cj_brightness), 1 + self.cj_brightness] if self.cj_brightness > 0 else None
             c = [max(0, 1 - self.cj_contrast), 1 + self.cj_contrast] if self.cj_contrast > 0 else None
@@ -156,6 +182,11 @@ class PreprocessMediaFile:
             cropped_image = convert_crop_and_resize(frame, resize_wh)
             if do_flip:
                 cropped_image = ImageOps.mirror(cropped_image)
+            if do_vflip:
+                cropped_image = ImageOps.flip(cropped_image)
+            if do_rotate:
+                cropped_image = cropped_image.rotate(rot_angle, resample=Image.BILINEAR)
+                cropped_image = ImageOps.fit(cropped_image, resize_wh)
             if self.use_color_jitter:
                 for fn_id in fn_idx:
                     if fn_id == 0 and b_fac is not None:
@@ -166,6 +197,8 @@ class PreprocessMediaFile:
                         cropped_image = TF.adjust_saturation(cropped_image, s_fac)
                     elif fn_id == 3 and h_fac is not None:
                         cropped_image = TF.adjust_hue(cropped_image, h_fac)
+            if do_blur:
+                cropped_image = cropped_image.filter(ImageFilter.GaussianBlur(blur_sigma))
             resized_video[i, ...] = self.pil_to_tensor(cropped_image)
 
         if hasattr(filepath_or_file, 'close'):
