@@ -11,6 +11,8 @@ import torchvision
 from PIL import Image, ImageOps
 from torchvision import transforms
 import imageio
+import random
+import torchvision.transforms.functional as TF
 
 from utils.common import is_main_process, VIDEO_EXTENSIONS, round_to_nearest_multiple, round_down_to_multiple
 
@@ -74,6 +76,18 @@ class PreprocessMediaFile:
             assert self.framerate
         self.tarfile_map = {}
 
+        aug_cfg = config.get('augmentations', {})
+        self.flip_prob = aug_cfg.get('horizontal_flip_prob', 0.0)
+        cj_cfg = aug_cfg.get('color_jitter', None)
+        if cj_cfg:
+            self.cj_brightness = cj_cfg.get('brightness', 0.0)
+            self.cj_contrast = cj_cfg.get('contrast', 0.0)
+            self.cj_saturation = cj_cfg.get('saturation', 0.0)
+            self.cj_hue = cj_cfg.get('hue', 0.0)
+            self.use_color_jitter = True
+        else:
+            self.use_color_jitter = False
+
     def __del__(self):
         for tar_f in self.tarfile_map.values():
             tar_f.close()
@@ -112,6 +126,14 @@ class PreprocessMediaFile:
         frames_rounded = round_down_to_multiple(size_bucket_frames - 1, self.round_frames) + 1
         resize_wh = (width_rounded, height_rounded)
 
+        do_flip = self.flip_prob > 0 and random.random() < self.flip_prob
+        if self.use_color_jitter:
+            b = [max(0, 1 - self.cj_brightness), 1 + self.cj_brightness] if self.cj_brightness > 0 else None
+            c = [max(0, 1 - self.cj_contrast), 1 + self.cj_contrast] if self.cj_contrast > 0 else None
+            s = [max(0, 1 - self.cj_saturation), 1 + self.cj_saturation] if self.cj_saturation > 0 else None
+            h = [-self.cj_hue, self.cj_hue] if self.cj_hue > 0 else None
+            b_fac, c_fac, s_fac, h_fac = transforms.ColorJitter.get_params(b, c, s, h)
+            fn_idx = torch.randperm(4)
         if mask_filepath:
             mask_img = Image.open(mask_filepath).convert('RGB')
             img_hw = (height, width)
@@ -132,6 +154,18 @@ class PreprocessMediaFile:
             if not isinstance(frame, Image.Image):
                 frame = torchvision.transforms.functional.to_pil_image(frame)
             cropped_image = convert_crop_and_resize(frame, resize_wh)
+            if do_flip:
+                cropped_image = ImageOps.mirror(cropped_image)
+            if self.use_color_jitter:
+                for fn_id in fn_idx:
+                    if fn_id == 0 and b_fac is not None:
+                        cropped_image = TF.adjust_brightness(cropped_image, b_fac)
+                    elif fn_id == 1 and c_fac is not None:
+                        cropped_image = TF.adjust_contrast(cropped_image, c_fac)
+                    elif fn_id == 2 and s_fac is not None:
+                        cropped_image = TF.adjust_saturation(cropped_image, s_fac)
+                    elif fn_id == 3 and h_fac is not None:
+                        cropped_image = TF.adjust_hue(cropped_image, h_fac)
             resized_video[i, ...] = self.pil_to_tensor(cropped_image)
 
         if hasattr(filepath_or_file, 'close'):
