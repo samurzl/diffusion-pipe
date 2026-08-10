@@ -1,23 +1,27 @@
 import os
 import sys
 import types
+import math
 sys.path.insert(0, os.path.join(os.path.abspath(os.path.dirname(__file__)), '../submodules/ComfyUI'))
 
 import torch
 from torch import nn
 import torch.nn.functional as F
 import comfy_kitchen as ck
+from peft.tuners.tuners_utils import BaseTunerLayer
 
 from models.base import ComfyPipeline, make_contiguous, PreprocessMediaFile, ModelWrapper
 from utils.common import AUTOCAST_DTYPE, get_lin_function, time_shift, one_at_a_time, round_down_to_multiple
 from utils.offloading import ModelOffloader
+from utils.nsync import NSYNCGradientController
+from utils.self_flow import mask_to_runs, representation_cosine_loss, sample_bernoulli_mask
 import comfy.latent_formats
 import comfy.model_management
 import comfy.ldm.minimax.model
 from comfy.ldm.modules.attention import optimized_attention
 from comfy.ldm.minimax.model import (
-    PackedLayout, time_shift_sigma, VISUAL_COND_TIMESTEP, AUDIO_COND_TIMESTEP, patchify_video, pack_audio,
-    rope_rotation_table, unpatchify_video, unpack_audio, MLP, AdalnProj,
+    PackedLayout, time_shift_sigma, patchify_video, pack_audio,
+    rope_rotation_table, unpatchify_video, MLP,
 )
 
 FRAMERATE = 24  # fixed for this model
@@ -138,14 +142,37 @@ class FinalLayer(nn.Module):
         self.video_out = operations.Linear(hidden, video_dim, bias=True, dtype=torch.float32, device=device)
         self.audio_out = operations.Linear(hidden, audio_dim, bias=True, dtype=torch.float32, device=device)
 
-    def forward(self, x, t_emb, video_seg, audio_seg):
-        # video_seg / audio_seg: (start, stop, timestep_row) of the target streams
+    def forward(self, x, t_emb, video_segments, audio_segments):
+        # Each segment is (start, stop, timestep_row). Self-Flow can therefore
+        # use a different final AdaLN timestep for arbitrary target-token runs.
+        def normalize_segments(segments):
+            if torch.is_tensor(segments):
+                segments = segments.tolist()
+            if len(segments) == 3 and not isinstance(segments[0], (list, tuple)):
+                segments = [segments]
+            return segments
+
+        video_segments = normalize_segments(video_segments)
+        audio_segments = normalize_segments(audio_segments)
+
         shift, scale = self.adaln_proj(t_emb)
-        va, vb, vrow = video_seg
-        aa, ab, arow = audio_seg
-        hv = (self.norm(x[:, va:vb]) * (1.0 + scale[:, vrow, None]) + shift[:, vrow, None]).to(torch.float32)
-        ha = (self.norm(x[:, aa:ab]) * (1.0 + scale[:, arow, None]) + shift[:, arow, None]).to(torch.float32)
-        return self.video_out(hv), self.audio_out(ha)
+        normalized = self.norm(x)
+
+        def project_segments(segments, head):
+            pieces = []
+            for start, stop, row in segments:
+                hidden = (
+                    normalized[:, start:stop]
+                    * (1.0 + scale[:, row, None])
+                    + shift[:, row, None]
+                ).to(torch.float32)
+                pieces.append(head(hidden))
+            return torch.cat(pieces, dim=1)
+
+        return (
+            project_segments(video_segments, self.video_out),
+            project_segments(audio_segments, self.audio_out),
+        )
 
 # batch-enabled
 comfy.ldm.minimax.model.FinalLayer = FinalLayer
@@ -186,6 +213,50 @@ class MinimaxH3Pipeline(ComfyPipeline):
         self.latent_format = comfy.latent_formats.MiniMaxH3Video()
         self.offloader = ModelOffloader('dummy', [], 0, 0, True, torch.device('cuda'), False, debug=False)
         self.framerate = FRAMERATE
+
+        training_methods = self.config.get('training_methods', {})
+        self.nsync_config = training_methods.get('nsync', {})
+        self.self_flow_config = training_methods.get('self_flow', {})
+        self.nsync_enabled = self.nsync_config.get('enabled', False)
+        self.self_flow_enabled = self.self_flow_config.get('enabled', False)
+        self.nsync_controller = None
+        if self.nsync_enabled:
+            self.nsync_controller = NSYNCGradientController(
+                eps=self.nsync_config.get('eps', 1e-8),
+                # DeepSpeed averages over the three role microbatches. Restore
+                # the logical positive-batch gradient scale after surgery.
+                gradient_scale=3.0,
+            )
+
+        self.self_flow_gamma = float(self.self_flow_config.get('gamma', 0.8))
+        self.self_flow_ema_decay = float(self.self_flow_config.get('ema_decay', 0.9999))
+        if self.self_flow_gamma < 0:
+            raise ValueError(f'Self-Flow gamma must be non-negative, got {self.self_flow_gamma}')
+        if not 0 <= self.self_flow_ema_decay < 1:
+            raise ValueError(f'Self-Flow ema_decay must be in [0, 1), got {self.self_flow_ema_decay}')
+        ema_dtype_name = self.self_flow_config.get('ema_dtype', 'float32')
+        ema_dtypes = {'float32': torch.float32, 'bfloat16': torch.bfloat16}
+        if ema_dtype_name not in ema_dtypes:
+            raise ValueError(f'Self-Flow ema_dtype must be one of {sorted(ema_dtypes)}, got {ema_dtype_name!r}')
+        self.self_flow_ema_dtype = ema_dtypes[ema_dtype_name]
+        self.self_flow_image_mask_ratio = float(self.self_flow_config.get('image_mask_ratio', 0.25))
+        self.self_flow_video_mask_ratio = float(self.self_flow_config.get('video_mask_ratio', 0.1))
+        self.self_flow_audio_mask_ratio = float(self.self_flow_config.get('audio_mask_ratio', 0.5))
+        self.self_flow_high_noise_fraction = float(self.self_flow_config.get('high_noise_fraction', 0.0))
+        if not 0 <= self.self_flow_high_noise_fraction <= 1:
+            raise ValueError(
+                f'Self-Flow high_noise_fraction must be in [0, 1], got {self.self_flow_high_noise_fraction}'
+            )
+        high_noise_range = self.self_flow_config.get('high_noise_range', [0.95, 1.0])
+        if len(high_noise_range) != 2 or not 0 <= high_noise_range[0] < high_noise_range[1] <= 1:
+            raise ValueError(f'Self-Flow high_noise_range must satisfy 0 <= low < high <= 1, got {high_noise_range}')
+        for name, ratio in (
+            ('image_mask_ratio', self.self_flow_image_mask_ratio),
+            ('video_mask_ratio', self.self_flow_video_mask_ratio),
+            ('audio_mask_ratio', self.self_flow_audio_mask_ratio),
+        ):
+            if not 0 <= ratio <= 0.5:
+                raise ValueError(f'Self-Flow {name} must be in [0, 0.5], got {ratio}')
 
         self.cfg = self.model_config.get('cfg', 1.0)
         if self.cfg > 1:
@@ -232,6 +303,150 @@ class MinimaxH3Pipeline(ComfyPipeline):
             rank = int(os.environ['LOCAL_RANK'])
             print(f'Loading model on rank {rank}')
             super().load_diffusion_model()
+
+    def configure_adapter(self, adapter_config):
+        super().configure_adapter(adapter_config)
+        if (self.self_flow_enabled or self.nsync_enabled) and adapter_config['type'] != 'lora':
+            raise ValueError('MiniMax H3 NSYNC and Self-Flow currently require adapter.type=lora')
+
+        if self.self_flow_enabled:
+            self._setup_self_flow_teacher_adapter()
+
+        if self.nsync_enabled:
+            student_parameters = [
+                parameter
+                for name, parameter in self.diffusion_model.named_parameters()
+                if parameter.requires_grad and '.default.' in name and 'lora_' in name
+            ]
+            self.nsync_controller.register_parameters(student_parameters)
+
+    def _iter_lora_layers(self):
+        for module in self.diffusion_model.modules():
+            if isinstance(module, BaseTunerLayer):
+                yield module
+
+    @staticmethod
+    def _set_layer_adapter(module, adapter_name):
+        # PEFT's public set_adapter also toggles requires_grad. That is unsafe
+        # between a student forward and its later pipeline-scheduled backward,
+        # so select the already-created adapter without changing leaf state.
+        module._active_adapter = [adapter_name]
+
+    def set_self_flow_adapter(self, adapter_name):
+        if not self.self_flow_enabled:
+            return
+        for module in self._iter_lora_layers():
+            self._set_layer_adapter(module, adapter_name)
+
+    @staticmethod
+    @torch.no_grad()
+    def _copy_adapter_weights(module, source_name, target_name, decay=None, link_for_save=False):
+        for container_name in ('lora_A', 'lora_B', 'lora_embedding_A', 'lora_embedding_B', 'lora_magnitude_vector'):
+            container = getattr(module, container_name, None)
+            if container is None or source_name not in container or target_name not in container:
+                continue
+            source = container[source_name]
+            target = container[target_name]
+            source_parameters = list(source.parameters()) if isinstance(source, nn.Module) else [source]
+            target_parameters = list(target.parameters()) if isinstance(target, nn.Module) else [target]
+            if len(source_parameters) != len(target_parameters):
+                raise RuntimeError(f'PEFT adapter parameter mismatch in {container_name}')
+            for source_parameter, target_parameter in zip(source_parameters, target_parameters):
+                if link_for_save:
+                    # Self-Flow evaluates with EMA weights. The saver uses this
+                    # link to emit the teacher value under the ordinary student
+                    # LoRA key, without including a second adapter in the file.
+                    source_parameter.ema_save_source = target_parameter
+                if decay is None:
+                    target_parameter.copy_(source_parameter)
+                else:
+                    target_parameter.mul_(decay).add_(source_parameter, alpha=1.0 - decay)
+
+    def _setup_self_flow_teacher_adapter(self):
+        self.self_flow_student_adapter = 'default'
+        self.self_flow_teacher_adapter = 'self_flow_teacher'
+        try:
+            self.lora_model.add_adapter(
+                self.self_flow_teacher_adapter,
+                self.peft_config,
+                autocast_adapter_dtype=False,
+            )
+        except TypeError:
+            # Compatibility with older PEFT releases.
+            self.lora_model.add_adapter(self.self_flow_teacher_adapter, self.peft_config)
+
+        for module in self._iter_lora_layers():
+            for container_name in (
+                'lora_A', 'lora_B', 'lora_embedding_A', 'lora_embedding_B', 'lora_magnitude_vector'
+            ):
+                container = getattr(module, container_name, None)
+                if container is None or self.self_flow_teacher_adapter not in container:
+                    continue
+                target = container[self.self_flow_teacher_adapter]
+                target_parameters = list(target.parameters()) if isinstance(target, nn.Module) else [target]
+                for target_parameter in target_parameters:
+                    target_parameter.data = target_parameter.data.to(self.self_flow_ema_dtype)
+            self._copy_adapter_weights(
+                module,
+                self.self_flow_student_adapter,
+                self.self_flow_teacher_adapter,
+                link_for_save=True,
+            )
+            if hasattr(module, 'lora_dropout') and self.self_flow_teacher_adapter in module.lora_dropout:
+                module.lora_dropout[self.self_flow_teacher_adapter] = nn.Identity()
+            self._set_layer_adapter(module, self.self_flow_student_adapter)
+
+        # Frozen parameters are omitted by the repository's DeepSpeed checkpoint
+        # flow. Keep EMA leaves checkpoint-visible but explicitly exclude them
+        # from the optimizer and final LoRA artifact.
+        for name, parameter in self.diffusion_model.named_parameters():
+            if f'.{self.self_flow_teacher_adapter}.' in name:
+                parameter.requires_grad_(True)
+                parameter.is_ema_teacher = True
+                parameter.skip_adapter_save = True
+                parameter.original_name = name
+            elif '.default.' in name and 'lora_' in name:
+                parameter.requires_grad_(True)
+
+    @torch.no_grad()
+    def sync_self_flow_teacher(self):
+        if not self.self_flow_enabled:
+            return
+        for module in self._iter_lora_layers():
+            self._copy_adapter_weights(module, self.self_flow_student_adapter, self.self_flow_teacher_adapter)
+        self.set_self_flow_adapter(self.self_flow_student_adapter)
+
+    @torch.no_grad()
+    def update_self_flow_teacher(self):
+        if not self.self_flow_enabled:
+            return
+        for module in self._iter_lora_layers():
+            self._copy_adapter_weights(
+                module,
+                self.self_flow_student_adapter,
+                self.self_flow_teacher_adapter,
+                decay=self.self_flow_ema_decay,
+            )
+        self.set_self_flow_adapter(self.self_flow_student_adapter)
+
+    def wrap_model_engine(self, model_engine):
+        if not (self.nsync_enabled or self.self_flow_enabled):
+            return
+        original_take_model_step = model_engine._take_model_step
+
+        def take_model_step(engine, *args, **kwargs):
+            if self.nsync_enabled:
+                self.last_nsync_stats = self.nsync_controller.apply_gradient_surgery()
+            skipped_steps_before = getattr(engine, 'skipped_steps', 0)
+            result = original_take_model_step(*args, **kwargs)
+            if (
+                self.self_flow_enabled
+                and getattr(engine, 'skipped_steps', 0) == skipped_steps_before
+            ):
+                self.update_self_flow_teacher()
+            return result
+
+        model_engine._take_model_step = types.MethodType(take_model_step, model_engine)
 
     # Override to exclude adaln, since full and pruned model have different sizes. Makes LoRA compatible with both.
     def get_target_modules(self, target_model):
@@ -284,10 +499,29 @@ class MinimaxH3Pipeline(ComfyPipeline):
 
     def to_layers(self):
         diffusion_model = self.diffusion_model
-        layers = [InitialLayer(diffusion_model)]
+        depth = len(diffusion_model.blocks)
+        student_layer = self.self_flow_config.get('student_layer', None)
+        teacher_layer = self.self_flow_config.get('teacher_layer', None)
+        if student_layer is None:
+            student_layer = max(1, round(float(self.self_flow_config.get('student_layer_ratio', 0.3)) * depth))
+        if teacher_layer is None:
+            teacher_layer = max(1, round(float(self.self_flow_config.get('teacher_layer_ratio', 0.7)) * depth))
+        self.self_flow_student_layer = int(student_layer) - 1
+        self.self_flow_teacher_layer = int(teacher_layer) - 1
+        if self.self_flow_enabled and not (
+            0 <= self.self_flow_student_layer < self.self_flow_teacher_layer < depth
+        ):
+            raise ValueError(
+                f'Self-Flow layers must satisfy 1 <= student_layer < teacher_layer <= {depth}; '
+                f'got {student_layer} and {teacher_layer}'
+            )
+
+        layers = [InitialLayer(diffusion_model, self)]
         for i, block in enumerate(diffusion_model.blocks):
-            layers.append(TransformerLayer(block, i, self.offloader))
-        layers.append(FinalLayer(diffusion_model, self.cfg))
+            layers.append(TransformerLayer(block, i, self.offloader, self))
+            if self.self_flow_enabled and i == self.self_flow_teacher_layer:
+                layers.append(SelfFlowLossLayer(diffusion_model, self))
+        layers.append(FinalLayer(diffusion_model, self.cfg, self))
         return layers
 
     # def to_layers(self):
@@ -307,6 +541,60 @@ class MinimaxH3Pipeline(ComfyPipeline):
         assert text_embeds.shape[:2] == attention_mask.shape[:2]
         attention_mask = attention_mask.to(torch.bool)
         return text_embeds, attention_mask
+
+    def _sample_timesteps(self, batch_size, device, frames, height, width, timestep_quantile=None):
+        timestep_sample_method = self.model_config.get('timestep_sample_method', 'logit_normal')
+        if timestep_sample_method == 'logit_normal':
+            distribution = torch.distributions.normal.Normal(0, 1)
+        elif timestep_sample_method == 'uniform':
+            distribution = torch.distributions.uniform.Uniform(0, 1)
+        else:
+            raise NotImplementedError(f'Unknown timestep_sample_method={timestep_sample_method}')
+
+        if timestep_quantile is not None:
+            timesteps = distribution.icdf(torch.full((batch_size,), timestep_quantile, device=device))
+        else:
+            timesteps = distribution.sample((batch_size,)).to(device)
+
+        if timestep_sample_method == 'logit_normal':
+            timesteps = torch.sigmoid(timesteps * self.model_config.get('sigmoid_scale', 1.0))
+
+        shift = self.model_config.get('shift', None)
+        if frames == 1:
+            shift = self.model_config.get('image_shift', shift)
+        if shift:
+            timesteps = (timesteps * shift) / (1 + (shift - 1) * timesteps)
+        elif self.model_config.get('flux_shift', False):
+            mu = get_lin_function(y1=0.5, y2=1.15)((height // 2) * (width // 2))
+            timesteps = time_shift(mu, 1.0, timesteps)
+
+        # The Self-Flow video ablation found that explicitly retaining a small
+        # amount of very-low-SNR training data can help a logit-normal schedule.
+        high_noise_fraction = self.self_flow_high_noise_fraction
+        if (
+            self.self_flow_enabled
+            and frames > 1
+            and timestep_quantile is None
+            and high_noise_fraction > 0
+        ):
+            low, high = self.self_flow_config.get('high_noise_range', [0.95, 1.0])
+            replace = torch.rand(batch_size, device=device) < high_noise_fraction
+            high_noise = torch.empty(batch_size, device=device).uniform_(float(low), float(high))
+            timesteps = torch.where(replace, high_noise, timesteps)
+        return timesteps
+
+    def _micro_batch_size_for_latents(self, frames, height, width):
+        config_key = 'image_micro_batch_size_per_gpu' if frames == 1 else 'micro_batch_size_per_gpu'
+        configured = self.config.get(config_key, self.config['micro_batch_size_per_gpu'])
+        if isinstance(configured, int):
+            return configured
+
+        batch_sizes = dict(configured)
+        if None in batch_sizes:
+            return batch_sizes[None]
+        pixel_size = math.sqrt(height * width) * self.spatial_compression
+        closest_size = min(batch_sizes, key=lambda size: abs(float(size) - pixel_size))
+        return batch_sizes[closest_size]
 
     def prepare_inputs(self, inputs, timestep_quantile=None):
         latents = inputs['latents'].float()
@@ -344,46 +632,87 @@ class MinimaxH3Pipeline(ComfyPipeline):
             mask = F.interpolate(mask, size=(h, w), mode='nearest-exact')  # resize to latent spatial dimension
             mask = mask.unsqueeze(2)
 
-        timestep_sample_method = self.model_config.get('timestep_sample_method', 'logit_normal')
-
-        if timestep_sample_method == 'logit_normal':
-            dist = torch.distributions.normal.Normal(0, 1)
-        elif timestep_sample_method == 'uniform':
-            dist = torch.distributions.uniform.Uniform(0, 1)
-        else:
-            raise NotImplementedError()
-
-        if timestep_quantile is not None:
-            t = dist.icdf(torch.full((bs,), timestep_quantile, device=device))
-        else:
-            t = dist.sample((bs,)).to(device)
-
-        if timestep_sample_method == 'logit_normal':
-            sigmoid_scale = self.model_config.get('sigmoid_scale', 1.0)
-            t = t * sigmoid_scale
-            t = torch.sigmoid(t)
-
-        shift = self.model_config.get('shift', None)
-        if f == 1:
-            shift = self.model_config.get('image_shift', shift)
-        if shift:
-            t = (t * shift) / (1 + (shift - 1) * t)
-        elif self.model_config.get('flux_shift', False):
-            mu = get_lin_function(y1=0.5, y2=1.15)((h // 2) * (w // 2))
-            t = time_shift(mu, 1.0, t)
+        t = self._sample_timesteps(bs, device, f, h, w, timestep_quantile=timestep_quantile)
 
         noise = torch.randn_like(latents)
-        t_expanded = t.view(-1, 1, 1, 1, 1)
-        noisy_latents = (1 - t_expanded) * latents + t_expanded * noise
         target = noise - latents
 
         # audio
         audio_noise = torch.randn_like(audio_latents)
         # fixed t -> audio_t mapping, matches the shift used in model code to derive the audio t from video t
         audio_t = time_shift_sigma(t, self.diffusion_model.sigma_shift_video, self.diffusion_model.sigma_shift_audio)
-        audio_t_expanded = audio_t.view(-1, 1, 1, 1)
-        noisy_audio_latents = (1 - audio_t_expanded) * audio_latents + audio_t_expanded * audio_noise
         audio_target = audio_noise - audio_latents
+
+        if self.self_flow_enabled:
+            training_self_flow = timestep_quantile is None
+            if training_self_flow:
+                s = self._sample_timesteps(bs, device, f, h, w)
+                video_mask_ratio = self.self_flow_image_mask_ratio if f == 1 else self.self_flow_video_mask_ratio
+                _, patch_h, patch_w = self.diffusion_model.patch_size
+                micro_batch_size = self._micro_batch_size_for_latents(f, h, w)
+                if bs % micro_batch_size != 0:
+                    raise RuntimeError(
+                        f'Self-Flow prepared {bs} examples, which is not divisible by the '
+                        f'configured physical microbatch size {micro_batch_size}'
+                    )
+                mask_groups = bs // micro_batch_size
+                # MiniMax's batch-enabled AdaLN path currently shares segment
+                # boundaries within a physical microbatch. Sample independently
+                # between physical microbatches and share only within each one.
+                video_token_mask = sample_bernoulli_mask(
+                    (mask_groups, f, h // patch_h, w // patch_w), video_mask_ratio, device
+                )
+                video_token_mask = video_token_mask.repeat_interleave(micro_batch_size, dim=0)
+                audio_token_mask = sample_bernoulli_mask(
+                    (mask_groups, 2, audio_latents.shape[-1]), self.self_flow_audio_mask_ratio, device
+                )
+                audio_token_mask = audio_token_mask.repeat_interleave(micro_batch_size, dim=0)
+                self_flow_weight = torch.ones(bs, dtype=torch.float32, device=device)
+            else:
+                # Quantile evaluation remains homogeneous and reports only the
+                # generation objective, while keeping pipeline tensor structure.
+                s = t
+                _, patch_h, patch_w = self.diffusion_model.patch_size
+                video_token_mask = torch.zeros((bs, f, h // patch_h, w // patch_w), dtype=torch.bool, device=device)
+                audio_token_mask = torch.zeros((bs, 2, audio_latents.shape[-1]), dtype=torch.bool, device=device)
+                self_flow_weight = torch.zeros(bs, dtype=torch.float32, device=device)
+
+            video_mask_expanded = video_token_mask.unsqueeze(1)
+            video_mask_expanded = video_mask_expanded.repeat_interleave(patch_h, dim=-2).repeat_interleave(patch_w, dim=-1)
+            video_sigmas = torch.where(
+                video_mask_expanded,
+                s.view(-1, 1, 1, 1, 1),
+                t.view(-1, 1, 1, 1, 1),
+            )
+            noisy_latents = (1 - video_sigmas) * latents + video_sigmas * noise
+
+            audio_s = time_shift_sigma(s, self.diffusion_model.sigma_shift_video, self.diffusion_model.sigma_shift_audio)
+            audio_sigmas = torch.where(
+                audio_token_mask.unsqueeze(1),
+                audio_s.view(-1, 1, 1, 1),
+                audio_t.view(-1, 1, 1, 1),
+            )
+            noisy_audio_latents = (1 - audio_sigmas) * audio_latents + audio_sigmas * audio_noise
+
+            minimum_t = torch.minimum(t, s)
+            minimum_t_expanded = minimum_t.view(-1, 1, 1, 1, 1)
+            teacher_latents = (1 - minimum_t_expanded) * latents + minimum_t_expanded * noise
+            minimum_audio_t = time_shift_sigma(
+                minimum_t,
+                self.diffusion_model.sigma_shift_video,
+                self.diffusion_model.sigma_shift_audio,
+            )
+            minimum_audio_t_expanded = minimum_audio_t.view(-1, 1, 1, 1)
+            teacher_audio_latents = (
+                (1 - minimum_audio_t_expanded) * audio_latents
+                + minimum_audio_t_expanded * audio_noise
+            )
+        else:
+            t_expanded = t.view(-1, 1, 1, 1, 1)
+            noisy_latents = (1 - t_expanded) * latents + t_expanded * noise
+            audio_t_expanded = audio_t.view(-1, 1, 1, 1)
+            noisy_audio_latents = (1 - audio_t_expanded) * audio_latents + audio_t_expanded * audio_noise
+            self_flow_weight = torch.zeros(bs, dtype=torch.float32, device=device)
 
         if self.cfg > 1:
             tmp = {}
@@ -396,7 +725,24 @@ class MinimaxH3Pipeline(ComfyPipeline):
         else:
             unconds = tuple()
 
-        return (noisy_latents, noisy_audio_latents, valid_audio, t, *conds, *unconds), (target, audio_target, mask)
+        roles = inputs.get('nsync_role', None)
+        if roles is None:
+            roles = torch.full((bs,), -1, dtype=torch.int64, device=device)
+        else:
+            roles = roles.to(device=device, dtype=torch.int64)
+
+        features = (noisy_latents, noisy_audio_latents, valid_audio, t, roles)
+        if self.self_flow_enabled:
+            features = (
+                *features,
+                teacher_latents,
+                teacher_audio_latents,
+                s,
+                video_token_mask,
+                audio_token_mask,
+            )
+        features = (*features, *conds, *unconds)
+        return features, (target, audio_target, self_flow_weight, mask)
 
     def get_loss_fn(self):
         @torch.autocast('cuda', enabled=False)
@@ -416,24 +762,32 @@ class MinimaxH3Pipeline(ComfyPipeline):
             return loss
 
         def loss_fn(outputs, label):
-            output, audio_output = outputs
-            target, audio_target, mask = label
+            if self.self_flow_enabled:
+                output, audio_output, representation_loss = outputs
+            else:
+                output, audio_output = outputs
+                representation_loss = None
+            target, audio_target, self_flow_weight, mask = label
             video_loss = single_loss(output, target, mask=mask)
             # audio_target may be padded to match another example's audio length from the same
             # gradient-accumulation group (see MinimaxH3Pipeline.prepare_inputs); audio_output's
             # length is authoritative since the model derives it from this example's own valid_audio flag.
             audio_target = audio_target[..., :audio_output.shape[-1]]
             audio_loss = single_loss(audio_output, audio_target)
-            # make each token count the same for loss, regardless of modality
-            # TODO: what is the best thing to do here? configurable audio loss scale?
+            # Make each token count the same by default, while allowing the two
+            # modalities to be reweighted for Self-Flow experiments.
             video_tokens = video_loss.numel()
             audio_tokens = audio_loss.numel()
             total_tokens = video_tokens + audio_tokens
-            video_loss = video_loss.mean() * video_tokens / total_tokens
-            audio_loss = audio_loss.mean() * audio_tokens / total_tokens
+            video_weight = float(self.self_flow_config.get('video_loss_weight', 1.0))
+            audio_weight = float(self.self_flow_config.get('audio_loss_weight', 1.0))
+            video_loss = video_loss.mean() * video_tokens / total_tokens * video_weight
+            audio_loss = audio_loss.mean() * audio_tokens / total_tokens * audio_weight
             loss = video_loss
             if audio_tokens > 0:  # avoid NaN for no audio
                 loss = loss + audio_loss
+            if representation_loss is not None:
+                loss = loss + self.self_flow_gamma * representation_loss * self_flow_weight.float().mean()
             return loss
         return loss_fn
 
@@ -465,8 +819,18 @@ class MinimaxH3Pipeline(ComfyPipeline):
         self.offloader.prepare_block_devices_before_forward()
 
 
+_H3_BRANCH_SIZE = 7
+
+
+def _mark_no_backward(values):
+    for value in values:
+        if torch.is_tensor(value):
+            value.no_backward = True
+    return values
+
+
 class InitialLayer(nn.Module):
-    def __init__(self, model):
+    def __init__(self, model, pipeline):
         super().__init__()
         if model.use_adaln_curves:
             self.adaln_t_table = model.adaln_t_table
@@ -478,68 +842,113 @@ class InitialLayer(nn.Module):
         self.rope = model.rope
         self.token_refiner = model.token_refiner
         self.model = [model]
+        self.pipeline = [pipeline]
 
     def __getattr__(self, name):
         return getattr(self.model[0], name)
 
-    def make_packed_sequence(self, video_x, audio_x, valid_audio, t, context, context_mask):
-        assert video_x.shape[0] == 1  # needs batch dimension with batch size 1
+    @property
+    def training_pipeline(self):
+        return self.pipeline[0]
 
+    def _embed_timesteps(self, values, device, dtype):
+        t_vals = torch.tensor(values, dtype=torch.float32, device=device)
+        if self.use_adaln_curves:
+            table = comfy.model_management.cast_to(self.adaln_t_table, device=device)
+            pos = t_vals.clamp(0.0, 1.0) * (table.shape[0] - 1)
+            i0 = pos.floor().long().clamp(max=table.shape[0] - 2)
+            return torch.lerp(table[i0], table[i0 + 1], (pos - i0).unsqueeze(1))
+        return self.time_embedder(t_vals).to(dtype)
+
+    @staticmethod
+    def _append_mask_runs(mod_segments, output_segments, start, stop, mask,
+                          false_row, true_row, modality_tag, output_kind):
+        for absolute_start, absolute_stop, row in mask_to_runs(
+            mask, start, stop, false_row, true_row
+        ):
+            mod_segments.append((absolute_start, absolute_stop, row * 3 + modality_tag))
+            output_segments.append((output_kind, absolute_start, absolute_stop, row))
+
+    def make_packed_sequence(self, video_x, audio_x, valid_audio, t, context, context_mask,
+                             mode='standard', s=None, video_token_mask=None, audio_token_mask=None):
+        assert video_x.shape[0] == 1
         if not valid_audio.item():
             audio_x = torch.empty([1, 32, 2, 0], device=video_x.device)
 
         transformer_options = {}
         payload = {}
         device = video_x.device
-        dtype = context.dtype  # compute dtype
-
-        latent_t, lat_h, lat_w = video_x.shape[2], video_x.shape[3], video_x.shape[4]
+        dtype = context.dtype
+        latent_t, lat_h, lat_w = video_x.shape[2:]
         audio_t = audio_x.shape[-1]
+        if audio_token_mask is not None:
+            audio_token_mask = audio_token_mask[..., :audio_t]
         text_len = context.shape[1]
-        # extra_conds prebuilds the layout once per sampling run
-        layout = payload.get("layout")
-        if layout is None or layout.signature != (text_len, latent_t, lat_h, lat_w, audio_t):
-            layout = PackedLayout(text_len, latent_t, lat_h, lat_w, audio_t,
-                                  keyframes=payload.get("keyframes"),
-                                  refs=payload.get("refs"),
-                                  frame_count=payload.get("frame_count"))
+        layout = PackedLayout(text_len, latent_t, lat_h, lat_w, audio_t)
 
-        # model_base passes model_sampling.timestep(sigma) = sigma * 1000
-        shift_v = float(transformer_options.get("minimax_h3_sigma_shift_video", self.sigma_shift_video))
-        shift_a = float(transformer_options.get("minimax_h3_sigma_shift_audio", self.sigma_shift_audio))
-        sigma_v = (t.flatten()[0]).float().clamp(min=1e-6)  # I removed the 1000 from original comfy code since our t is [0, 1]
-        t_v = float(1.0 - sigma_v)
-        t_a = float(1.0 - time_shift_sigma(sigma_v, shift_v, shift_a))
+        shift_v = float(transformer_options.get('minimax_h3_sigma_shift_video', self.sigma_shift_video))
+        shift_a = float(transformer_options.get('minimax_h3_sigma_shift_audio', self.sigma_shift_audio))
+        sigma_v = t.flatten()[0].float().clamp(min=1e-6)
+        video_time = float(1.0 - sigma_v)
+        audio_time = float(1.0 - time_shift_sigma(sigma_v, shift_v, shift_a))
 
-        # distinct timesteps are known analytically: text/pad follow video, cond rows pin near 1
-        vis_aug = float(payload.get("visual_cond_noise_aug", VISUAL_COND_TIMESTEP))
-        aud_aug = float(payload.get("audio_cond_noise_aug", AUDIO_COND_TIMESTEP))
-        has_vis_cond = any(k in ("cond", "ref_img") for _, _, k in layout.segments)
-        has_aud_cond = any(k == "ref_audio" for _, _, k in layout.segments)
-        seg_t = {"text": t_v, "video": t_v, "audio": t_a,
-                 "cond": max(t_v, vis_aug), "ref_img": max(t_v, vis_aug),
-                 "ref_audio": max(t_a, aud_aug)}
-        unique_t = sorted({t_v, t_a} | ({seg_t["cond"]} if has_vis_cond else set())
-                          | ({seg_t["ref_audio"]} if has_aud_cond else set()))
-        t_row = {t: i for i, t in enumerate(unique_t)}
-        seg_tag = {"text": 1, "video": 0, "audio": 2, "cond": 0, "ref_img": 0, "ref_audio": 2}
-
-        text_tags = payload.get("text_token_tags")
         mod_segments = []
-        for a, b, kind in layout.segments:
-            row_base = t_row[seg_t[kind]] * 3
-            if kind == "text" and text_tags is not None:
-                # the presentation text span mixes tags (vision pads carry the video modality) split into tag runs
-                tags = text_tags.view(-1).tolist()
-                run_start = 0
-                for i in range(1, b - a + 1):
-                    if i == b - a or tags[i] != tags[run_start]:
-                        mod_segments.append((a + run_start, a + i, row_base + int(tags[run_start])))
-                        run_start = i
-            else:
-                mod_segments.append((a, b, row_base + seg_tag[kind]))
+        output_segments = []
+        if mode == 'standard':
+            timestep_values = sorted({video_time, audio_time})
+            rows = {value: index for index, value in enumerate(timestep_values)}
+            kind_rows = {'text': rows[video_time], 'video': rows[video_time], 'audio': rows[audio_time]}
+            kind_tags = {'text': 1, 'video': 0, 'audio': 2}
+            for start, stop, kind in layout.segments:
+                row = kind_rows[kind]
+                mod_segments.append((start, stop, row * 3 + kind_tags[kind]))
+                if kind == 'video':
+                    output_segments.append((0, start, stop, row))
+                elif kind == 'audio':
+                    output_segments.append((1, start, stop, row))
+        elif mode == 'mixed':
+            sigma_s = s.flatten()[0].float().clamp(min=1e-6)
+            timestep_values = [
+                video_time,
+                float(1.0 - sigma_s),
+                audio_time,
+                float(1.0 - time_shift_sigma(sigma_s, shift_v, shift_a)),
+            ]
+            for start, stop, kind in layout.segments:
+                if kind == 'text':
+                    mod_segments.append((start, stop, 1))
+                elif kind == 'video':
+                    self._append_mask_runs(
+                        mod_segments, output_segments, start, stop, video_token_mask,
+                        false_row=0, true_row=1, modality_tag=0, output_kind=0,
+                    )
+                elif kind == 'audio':
+                    self._append_mask_runs(
+                        mod_segments, output_segments, start, stop, audio_token_mask,
+                        false_row=2, true_row=3, modality_tag=2, output_kind=1,
+                    )
+                else:
+                    raise RuntimeError(f'Unsupported Self-Flow packed segment kind: {kind}')
+        elif mode == 'teacher':
+            sigma_min = torch.minimum(sigma_v, s.flatten()[0].float().clamp(min=1e-6))
+            timestep_values = [
+                float(1.0 - sigma_min),
+                float(1.0 - time_shift_sigma(sigma_min, shift_v, shift_a)),
+            ]
+            for start, stop, kind in layout.segments:
+                if kind == 'text':
+                    mod_segments.append((start, stop, 1))
+                elif kind == 'video':
+                    mod_segments.append((start, stop, 0))
+                    output_segments.append((0, start, stop, 0))
+                elif kind == 'audio':
+                    mod_segments.append((start, stop, 1 * 3 + 2))
+                    output_segments.append((1, start, stop, 1))
+                else:
+                    raise RuntimeError(f'Unsupported Self-Flow packed segment kind: {kind}')
+        else:
+            raise ValueError(f'Unknown MiniMax H3 packing mode: {mode}')
 
-        # embed
         img_update = layout.img_update.to(device)
         audio_update = layout.audio_update.to(device)
         video_rows = patchify_video(video_x.to(torch.float32), self.patch_size)
@@ -560,169 +969,346 @@ class InitialLayer(nn.Module):
 
         video_embed = self.video_patch_proj(all_video_rows).to(dtype)
         audio_embed = self.audio_patch_proj(all_audio_rows).to(dtype)
-
         text_states = context
         if text_states.shape[-1] != self.hidden_size:
-            text_states = self.token_refiner(self.condition_proj(text_states),
-                                             transformer_options=transformer_options)
-        text_states = text_states[0]  # this happens after since token_refiner uses the new batch-enabled Attention
+            text_states = self.token_refiner(
+                self.condition_proj(text_states), transformer_options=transformer_options
+            )
+        text_states = text_states[0]
 
-        # segments are contiguous: assemble by slices, embed rows follow segment order
         h = torch.empty(layout.seq_len, self.hidden_size, dtype=dtype, device=device)
         attention_mask = torch.ones((layout.seq_len,), dtype=context_mask.dtype, device=device)
-        voff = aoff = 0
-        for a, b, kind in layout.segments:
-            n = b - a
-            if kind == "text":
-                h[a:b] = text_states
-                attention_mask[a:b] = context_mask
-            elif kind in ("cond", "ref_img", "video"):
-                h[a:b] = video_embed[voff:voff + n]
-                voff += n
-            else:  # ref_audio / audio
-                h[a:b] = audio_embed[aoff:aoff + n]
-                aoff += n
-
-        t_vals = torch.tensor(unique_t, dtype=torch.float32, device=device)
-        if self.use_adaln_curves:
-            # adaln projections consume interpolated coordinates of the time-embedding curve
-            table = comfy.model_management.cast_to(self.adaln_t_table, device=device)
-            pos = t_vals.clamp(0.0, 1.0) * (table.shape[0] - 1)     # t in [0,1] -> fractional grid index, out-of-range t clamps to the curve ends
-            i0 = pos.floor().long().clamp(max=table.shape[0] - 2)   # lower grid row, max-clamp keeps t=1.0 on the last interval instead of reading past the table
-            t_emb = torch.lerp(table[i0], table[i0 + 1], (pos - i0).unsqueeze(1))  # blend the two rows by the fractional part
-        else:
-            t_emb = self.time_embedder(t_vals).to(dtype)
-
-        # rotation table computed once per forward, consumed by the kitchen split-half rope
-        rope_freqs = rope_rotation_table(self.rope_freqs(layout.position_ids, device), dtype)
-
-        video_seg = next((a, b, t_row[seg_t["video"]]) for a, b, k in layout.segments if k == "video")
-        audio_seg = next((a, b, t_row[seg_t["audio"]]) for a, b, k in layout.segments if k == "audio")
-        # pack these as ints so we can pass as tensor between pipeline parallel layers
-        mod_segments = torch.tensor(mod_segments, dtype=torch.int32, device=h.device)
-        extra_ints = torch.tensor([*video_seg, *audio_seg, latent_t, lat_h, lat_w], dtype=torch.int32, device=h.device)
-
-        return h, attention_mask, t_emb, mod_segments, rope_freqs, extra_ints
-
-    def make_layer_inputs(self, video_x, audio_x, valid_audio, t, context, context_mask):
-        first_mod_seqments = None
-        h_list, attention_mask_list, t_emb_list = [], [], []
-        for items in zip(video_x, audio_x, valid_audio, t, context, context_mask):
-            h, attention_mask, t_emb, mod_segments, rope_freqs, extra_ints = self.make_packed_sequence(*(x.unsqueeze(0) for x in items))
-            if first_mod_seqments is None:
-                first_mod_seqments = mod_segments
+        video_offset = audio_offset = 0
+        for start, stop, kind in layout.segments:
+            length = stop - start
+            if kind == 'text':
+                h[start:stop] = text_states
+                attention_mask[start:stop] = context_mask
+            elif kind in ('cond', 'ref_img', 'video'):
+                h[start:stop] = video_embed[video_offset:video_offset + length]
+                video_offset += length
             else:
-                # A critical assertion: the batch-enabled AdaLN code only works if all mod_segments are the same (which they will be for this training code).
-                assert (mod_segments == first_mod_seqments).all()
+                h[start:stop] = audio_embed[audio_offset:audio_offset + length]
+                audio_offset += length
+
+        t_emb = self._embed_timesteps(timestep_values, device, dtype)
+        rope_freqs = rope_rotation_table(self.rope_freqs(layout.position_ids, device), dtype)
+        mod_segments = torch.tensor(mod_segments, dtype=torch.int32, device=device)
+        output_segments = torch.tensor(output_segments, dtype=torch.int32, device=device)
+        extra_ints = torch.tensor([latent_t, lat_h, lat_w], dtype=torch.int32, device=device)
+        return h, attention_mask, t_emb, mod_segments, rope_freqs, extra_ints, output_segments
+
+    def make_layer_inputs(self, video_x, audio_x, valid_audio, t, context, context_mask,
+                          mode='standard', s=None, video_token_mask=None, audio_token_mask=None):
+        first_mod_segments = first_output_segments = None
+        h_list, attention_mask_list, t_emb_list = [], [], []
+        batch_size = video_x.shape[0]
+        for index in range(batch_size):
+            packed = self.make_packed_sequence(
+                video_x[index:index + 1],
+                audio_x[index:index + 1],
+                valid_audio[index:index + 1],
+                t[index:index + 1],
+                context[index:index + 1],
+                context_mask[index:index + 1],
+                mode=mode,
+                s=None if s is None else s[index:index + 1],
+                video_token_mask=None if video_token_mask is None else video_token_mask[index:index + 1],
+                audio_token_mask=None if audio_token_mask is None else audio_token_mask[index:index + 1],
+            )
+            h, attention_mask, t_emb, mod_segments, rope_freqs, extra_ints, output_segments = packed
+            if first_mod_segments is None:
+                first_mod_segments = mod_segments
+                first_output_segments = output_segments
+            elif not (
+                torch.equal(mod_segments, first_mod_segments)
+                and torch.equal(output_segments, first_output_segments)
+            ):
+                raise RuntimeError(
+                    'MiniMax H3 requires shared Self-Flow token-mask segment boundaries within a microbatch'
+                )
             h_list.append(h)
             attention_mask_list.append(attention_mask)
             t_emb_list.append(t_emb)
 
-        h = torch.stack(h_list, dim=0)
-        attention_mask = torch.stack(attention_mask_list, dim=0)[:, None, None, :]  # 4D bool for SDPA
+        h = torch.stack(h_list)
+        attention_mask = torch.stack(attention_mask_list)[:, None, None, :]
         t_emb = torch.stack(t_emb_list)
-        outputs = make_contiguous(h, attention_mask, t_emb, mod_segments, rope_freqs, extra_ints)
+        outputs = make_contiguous(
+            h, attention_mask, t_emb, first_mod_segments, rope_freqs, extra_ints, first_output_segments
+        )
         for item in outputs:
-            if torch.is_floating_point(item):
+            if torch.is_tensor(item) and torch.is_floating_point(item):
                 item.requires_grad_(True)
         return outputs
 
-    # TODO: will need to handle text_token_tags (and probably more) for reference images. it's all 1s for pure text prompt
-    # TODO: would be good to allow batch_size>1, but have to change a lot of this code and also pass context_mask through
     @torch.autocast('cuda', dtype=AUTOCAST_DTYPE)
     @torch.compiler.disable
     def forward(self, inputs):
-        video_x, audio_x, valid_audio, t, *variable = inputs
-        if len(variable) == 2:
-            context, context_mask = variable
-            has_uncond_branch = False
+        video_x, audio_x, valid_audio, t, roles, *variable = inputs
+        pipeline = self.training_pipeline
+        if pipeline.self_flow_enabled:
+            teacher_video_x, teacher_audio_x, s, video_token_mask, audio_token_mask, *variable = variable
+            packing_mode = 'mixed'
         else:
-            context, context_mask, context_uncond, context_mask_uncond = variable
-            has_uncond_branch = True
+            teacher_video_x = teacher_audio_x = s = video_token_mask = audio_token_mask = None
+            packing_mode = 'standard'
 
-        outputs = self.make_layer_inputs(video_x, audio_x, valid_audio, t, context, context_mask)
-        if has_uncond_branch:
-            # TODO: what happens if we have gradient on the entire uncond branch?
+        context, context_mask, *variable = variable
+        if pipeline.cfg > 1:
+            context_uncond, context_mask_uncond = variable
+        else:
+            context_uncond = context_mask_uncond = None
+
+        pipeline.set_self_flow_adapter(getattr(pipeline, 'self_flow_student_adapter', 'default'))
+        primary = self.make_layer_inputs(
+            video_x, audio_x, valid_audio, t, context, context_mask,
+            mode=packing_mode, s=s, video_token_mask=video_token_mask, audio_token_mask=audio_token_mask,
+        )
+        if pipeline.nsync_enabled:
+            primary = (pipeline.nsync_controller.tag_output(primary[0], roles), *primary[1:])
+
+        outputs = primary
+        if pipeline.self_flow_enabled:
+            pipeline.set_self_flow_adapter(pipeline.self_flow_teacher_adapter)
             with torch.no_grad():
-                h_uncond, attention_mask_uncond, _, mod_segments_uncond, rope_freqs_uncond, extra_ints_uncond = self.make_layer_inputs(video_x, audio_x, valid_audio, t, context_uncond, context_mask_uncond)
-            uncond_tensors = (h_uncond, attention_mask_uncond, mod_segments_uncond, rope_freqs_uncond, extra_ints_uncond)
-            for x in uncond_tensors:
-                x.no_backward = True
-            outputs = (*outputs, *uncond_tensors)
-        return outputs
+                teacher = self.make_layer_inputs(
+                    teacher_video_x, teacher_audio_x, valid_audio, t, context, context_mask,
+                    mode='teacher', s=s,
+                )
+            outputs = (*outputs, *_mark_no_backward(teacher))
+            pipeline.set_self_flow_adapter(pipeline.self_flow_student_adapter)
+
+        if pipeline.cfg > 1:
+            with torch.no_grad():
+                uncond = self.make_layer_inputs(
+                    video_x, audio_x, valid_audio, t, context_uncond, context_mask_uncond,
+                    mode=packing_mode, s=s, video_token_mask=video_token_mask, audio_token_mask=audio_token_mask,
+                )
+            outputs = (*outputs, *_mark_no_backward(uncond))
+
+        student_feature = primary[0].new_empty((0,))
+        teacher_feature = primary[0].new_empty((0,))
+        student_feature.no_backward = True
+        teacher_feature.no_backward = True
+        return (*outputs, roles, student_feature, teacher_feature)
+
 
 class TransformerLayer(nn.Module):
-    def __init__(self, layer, block_idx, offloader):
+    def __init__(self, layer, block_idx, offloader, pipeline):
         super().__init__()
         self.layer = layer
         self.block_idx = block_idx
         self.offloader = offloader
+        self.pipeline = [pipeline]
+
+    @property
+    def training_pipeline(self):
+        return self.pipeline[0]
+
+    @staticmethod
+    def _take_branch(inputs, offset):
+        return tuple(inputs[offset:offset + _H3_BRANCH_SIZE]), offset + _H3_BRANCH_SIZE
 
     @torch.autocast('cuda', dtype=AUTOCAST_DTYPE)
     def forward(self, inputs):
-        h, attention_mask, t_emb, mod_segments, rope_freqs, extra_ints, *uncond_tensors = inputs
+        pipeline = self.training_pipeline
+        primary, offset = self._take_branch(inputs, 0)
+        teacher = None
+        if pipeline.self_flow_enabled:
+            teacher, offset = self._take_branch(inputs, offset)
+        uncond = None
+        if pipeline.cfg > 1:
+            uncond, offset = self._take_branch(inputs, offset)
+        roles, student_feature, teacher_feature = inputs[offset:offset + 3]
 
+        h, attention_mask, t_emb, mod_segments, rope_freqs, extra_ints, output_segments = primary
         self.offloader.wait_for_block(self.block_idx)
 
+        pipeline.set_self_flow_adapter(getattr(pipeline, 'self_flow_student_adapter', 'default'))
         h = self.layer(h, t_emb, mod_segments.tolist(), rope_freqs, attention_mask=attention_mask)
-        if len(uncond_tensors) > 0:
-            h_uncond, attention_mask_uncond, mod_segments_uncond, rope_freqs_uncond, extra_ints_uncond = uncond_tensors
-            # TODO: in the unsloth checkpointer, it only sees no_backward for all 5 tensors on the very first layer. For all other layers,
-            # it's only set on h_uncond. This works, and it avoids saving the one large tensor, but why is it like this?
-            if h_uncond is None:
-                # Backward pass recomputation, and we didn't save these tensors for backward. But we need same number of return values.
-                uncond_tensors = (None,)*len(uncond_tensors)
-            else:
+        if pipeline.nsync_enabled:
+            h = pipeline.nsync_controller.tag_output(h, roles)
+        if pipeline.self_flow_enabled and self.block_idx == pipeline.self_flow_student_layer:
+            student_feature = h
+        primary = (h, attention_mask, t_emb, mod_segments, rope_freqs, extra_ints, output_segments)
+
+        if teacher is not None:
+            h_teacher, attention_mask_teacher, t_emb_teacher, mod_segments_teacher, rope_freqs_teacher, extra_ints_teacher, output_segments_teacher = teacher
+            if h_teacher is not None and h_teacher.numel() > 0 and self.block_idx <= pipeline.self_flow_teacher_layer:
+                pipeline.set_self_flow_adapter(pipeline.self_flow_teacher_adapter)
                 with torch.no_grad():
-                    h_uncond = self.layer(h_uncond, t_emb, mod_segments_uncond.tolist(), rope_freqs_uncond, attention_mask=attention_mask_uncond)
-                uncond_tensors = (h_uncond, attention_mask_uncond, mod_segments_uncond, rope_freqs_uncond, extra_ints_uncond)
-                for x in uncond_tensors:
-                    x.no_backward = True
+                    h_teacher = self.layer(
+                        h_teacher,
+                        t_emb_teacher,
+                        mod_segments_teacher.tolist(),
+                        rope_freqs_teacher,
+                        attention_mask=attention_mask_teacher,
+                    )
+                if self.block_idx == pipeline.self_flow_teacher_layer:
+                    teacher_feature = h_teacher.detach()
+                    teacher_feature.no_backward = True
+                    h_teacher = h_teacher.new_empty((0,))
+                teacher = (
+                    h_teacher, attention_mask_teacher, t_emb_teacher, mod_segments_teacher,
+                    rope_freqs_teacher, extra_ints_teacher, output_segments_teacher,
+                )
+                teacher = _mark_no_backward(teacher)
 
+        if uncond is not None:
+            h_uncond, attention_mask_uncond, t_emb_uncond, mod_segments_uncond, rope_freqs_uncond, extra_ints_uncond, output_segments_uncond = uncond
+            if h_uncond is not None:
+                pipeline.set_self_flow_adapter(getattr(pipeline, 'self_flow_student_adapter', 'default'))
+                with torch.no_grad():
+                    h_uncond = self.layer(
+                        h_uncond,
+                        t_emb_uncond,
+                        mod_segments_uncond.tolist(),
+                        rope_freqs_uncond,
+                        attention_mask=attention_mask_uncond,
+                    )
+                uncond = (
+                    h_uncond, attention_mask_uncond, t_emb_uncond, mod_segments_uncond,
+                    rope_freqs_uncond, extra_ints_uncond, output_segments_uncond,
+                )
+                uncond = _mark_no_backward(uncond)
+
+        pipeline.set_self_flow_adapter(getattr(pipeline, 'self_flow_student_adapter', 'default'))
         self.offloader.submit_move_blocks_forward(self.block_idx)
+        if torch.is_tensor(student_feature) and student_feature.numel() == 0:
+            student_feature.no_backward = True
+        if (
+            pipeline.self_flow_enabled
+            and self.block_idx <= pipeline.self_flow_teacher_layer
+            and torch.is_tensor(teacher_feature)
+        ):
+            teacher_feature.no_backward = True
+        outputs = primary
+        if teacher is not None:
+            outputs = (*outputs, *teacher)
+        if uncond is not None:
+            outputs = (*outputs, *uncond)
+        return make_contiguous(*outputs, roles, student_feature, teacher_feature)
 
-        return make_contiguous(h, attention_mask, t_emb, mod_segments, rope_freqs, extra_ints, *uncond_tensors)
+
+class SelfFlowLossLayer(nn.Module):
+    """Collapse the two captured H3 features into the train-time scalar loss."""
+
+    def __init__(self, model, pipeline):
+        super().__init__()
+        self.pipeline = [pipeline]
+        projection_dim = int(pipeline.self_flow_config.get('projection_dim', 1024))
+        if projection_dim <= 0:
+            raise ValueError(f'Self-Flow projection_dim must be positive, got {projection_dim}')
+        reference = next(model.final_layer.parameters())
+        projection_dtype = pipeline.config['adapter']['dtype']
+        self.projection = nn.Sequential(
+            nn.Linear(model.hidden_size, projection_dim, bias=False, device=reference.device, dtype=projection_dtype),
+            nn.SiLU(),
+            nn.Linear(projection_dim, model.hidden_size, bias=False, device=reference.device, dtype=projection_dtype),
+        )
+        for name, parameter in self.projection.named_parameters():
+            parameter.original_name = f'self_flow_projection.{name}'
+            parameter.skip_adapter_save = True
+
+    @property
+    def training_pipeline(self):
+        return self.pipeline[0]
+
+    @staticmethod
+    def _target_features(hidden, output_segments):
+        pieces = [hidden[:, start:stop] for _, start, stop, _ in output_segments.tolist()]
+        return torch.cat(pieces, dim=1)
+
+    @torch.autocast('cuda', dtype=AUTOCAST_DTYPE)
+    def forward(self, inputs):
+        pipeline = self.training_pipeline
+        offset = _H3_BRANCH_SIZE
+        teacher = tuple(inputs[offset:offset + _H3_BRANCH_SIZE])
+        offset += _H3_BRANCH_SIZE
+        if pipeline.cfg > 1:
+            offset += _H3_BRANCH_SIZE
+        roles, student_feature, teacher_feature = inputs[offset:offset + 3]
+
+        if student_feature is None or teacher_feature is None or student_feature.numel() == 0 or teacher_feature.numel() == 0:
+            raise RuntimeError('Self-Flow did not capture its configured student and teacher layers')
+        primary_output_segments = inputs[_H3_BRANCH_SIZE - 1]
+        teacher_output_segments = teacher[-1]
+        student_targets = self._target_features(student_feature, primary_output_segments)
+        teacher_targets = self._target_features(teacher_feature, teacher_output_segments)
+        representation_loss = representation_cosine_loss(self.projection(student_targets), teacher_targets)
+
+        empty_feature = student_feature.new_empty((0,))
+        empty_feature.no_backward = True
+        return make_contiguous(*inputs[:offset], roles, empty_feature, representation_loss)
 
 
 class FinalLayer(nn.Module):
-    def __init__(self, model, cfg):
+    def __init__(self, model, cfg, pipeline):
         super().__init__()
         self.final_layer = model.final_layer
         self.model = [model]
+        self.pipeline = [pipeline]
         self.cfg = cfg
 
     def __getattr__(self, name):
         return getattr(self.model[0], name)
 
+    @property
+    def training_pipeline(self):
+        return self.pipeline[0]
+
+    @staticmethod
+    def _take_branch(inputs, offset):
+        return tuple(inputs[offset:offset + _H3_BRANCH_SIZE]), offset + _H3_BRANCH_SIZE
+
+    @staticmethod
+    def _segments_by_kind(output_segments, kind):
+        return [row[1:] for row in output_segments.tolist() if row[0] == kind]
+
+    def _decode_branch(self, branch):
+        h, _, t_emb, _, _, extra_ints, output_segments = branch
+        video_segments = self._segments_by_kind(output_segments, 0)
+        audio_segments = self._segments_by_kind(output_segments, 1)
+        latent_t, lat_h, lat_w = extra_ints
+        video_rows, audio_rows = self.final_layer(h, t_emb, video_segments, audio_segments)
+        video_out = unpatchify_video(
+            video_rows, latent_t, lat_h // 2, lat_w // 2, self.latents_dim, self.patch_size
+        )
+        return video_out, unpack_audio(audio_rows)
+
     @torch.autocast('cuda', dtype=AUTOCAST_DTYPE)
     @torch.compiler.disable
     def forward(self, inputs):
-        h, attention_mask, t_emb, mod_segments, rope_freqs, extra_ints, *uncond_tensors = inputs
-        video_seg = extra_ints[:3]
-        audio_seg = extra_ints[3:6]
-        latent_t, lat_h, lat_w = extra_ints[6:]
+        pipeline = self.training_pipeline
+        primary, offset = self._take_branch(inputs, 0)
+        teacher = None
+        if pipeline.self_flow_enabled:
+            teacher, offset = self._take_branch(inputs, offset)
+        uncond = None
+        if pipeline.cfg > 1:
+            uncond, offset = self._take_branch(inputs, offset)
+        _, student_feature, representation_loss = inputs[offset:offset + 3]
 
-        v, a = self.final_layer(h, t_emb, video_seg, audio_seg)
-        video_out = unpatchify_video(v, latent_t, lat_h // 2, lat_w // 2, self.latents_dim, self.patch_size)
-        audio_out = unpack_audio(a)
+        pipeline.set_self_flow_adapter(getattr(pipeline, 'self_flow_student_adapter', 'default'))
+        video_out, audio_out = self._decode_branch(primary)
 
-        if len(uncond_tensors) > 0:
+        if uncond is not None:
             assert self.cfg > 1
-            h_uncond, attention_mask_uncond, mod_segments_uncond, rope_freqs_uncond, extra_ints_uncond = uncond_tensors
-            video_seg = extra_ints_uncond[:3]
-            audio_seg = extra_ints_uncond[3:6]
-            latent_t, lat_h, lat_w = extra_ints_uncond[6:]
             with torch.no_grad():
-                v_uncond, a_uncond = self.final_layer(h_uncond, t_emb, video_seg, audio_seg)
-            video_out_uncond = unpatchify_video(v_uncond, latent_t, lat_h // 2, lat_w // 2, self.latents_dim, self.patch_size)
-            audio_out_uncond = unpack_audio(a_uncond)
-            # "raw" velocity from guidance-distilled output and own uncond (just rearrange CFG equation)
-            video_out = (video_out + (self.cfg-1)*video_out_uncond) / self.cfg
-            audio_out = (audio_out + (self.cfg-1)*audio_out_uncond) / self.cfg
+                video_out_uncond, audio_out_uncond = self._decode_branch(uncond)
+            video_out = (video_out + (self.cfg - 1) * video_out_uncond) / self.cfg
+            audio_out = (audio_out + (self.cfg - 1) * audio_out_uncond) / self.cfg
 
-        # We don't scale the audio's velocity like in inference, since that is an inference-only
-        # hack in order to use a single sampling schedule.
-        return -video_out, -audio_out
+        outputs = (-video_out, -audio_out)
+        if pipeline.self_flow_enabled:
+            if representation_loss is None or representation_loss.numel() != 1 or student_feature.numel() != 0:
+                raise RuntimeError('Self-Flow representation loss was not produced after the teacher layer')
+            outputs = (*outputs, representation_loss)
+
+        # Audio velocity is intentionally not schedule-slope-scaled during
+        # training; that MiniMax transform is inference-only.
+        return outputs
 
 
 # class Wrapper(nn.Module):

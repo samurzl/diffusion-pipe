@@ -648,6 +648,6 @@ shift = 8  # IDK what this should be but 1 is way too low for videos
 # CFG-augmented training to preserve distillation. Use either this or a training adapter (not both).
 cfg = 4
 ```
-There is a document for [MiniMax H3 notes](minimax_h3_notes.md). Read the whole thing before you train. Also look at the [MiniMax H3 example TOML](../examples/minimax_h3_example.toml).
+There is a document for [MiniMax H3 notes](minimax_h3_notes.md). Read the whole thing before you train. Also look at the [standard MiniMax H3 example](../examples/minimax_h3_example.toml) or the [combined NSYNC + Self-Flow example](../examples/minimax_h3_nsync_self_flow.toml).
 
 Everything is ComfyUI format, including the saved models. You can now train LoRAs directly on quantized models, and it is recommended to use int8 convrot (faster, better quality, and less VRAM).

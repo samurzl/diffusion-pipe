@@ -1,0 +1,25 @@
+# NSYNC requires one positive and one generated-negative directory for each
+# nsync_pair and size bucket. Files are paired by stem (shot_001.mp4 pairs with
+# shot_001.mp4 or shot_001.<another-supported-extension>).
+
+resolutions = [512]
+enable_ar_bucket = true
+min_ar = 0.5
+max_ar = 2.0
+num_ar_buckets = 7
+frame_buckets = [1, 33]
+
+[[directory]]
+path = '/path/to/target_positive_media'
+num_repeats = 1
+nsync_role = 'positive'
+nsync_pair = 'target_style'
+
+[[directory]]
+path = '/path/to/generated_negative_media'
+# Reuse the paired positive caption files. Each negative must express the same
+# caption/content while omitting the target concept or style.
+caption_path = '/path/to/target_positive_media'
+num_repeats = 1
+nsync_role = 'negative'
+nsync_pair = 'target_style'

@@ -67,11 +67,14 @@ class Saver:
             partial_state_dict = {}
             for name, p in self.pipeline_model.named_parameters():
                 if p.requires_grad:
+                    if getattr(p, 'skip_adapter_save', False):
+                        continue
                     if not hasattr(p, 'original_name'):
                         logger.warning(f'WARNING: parameter {name} requires_grad but does not have original_name. Not saving it.')
                         continue
                     # TODO: maybe this needs to change if we ever have non-lora adapters?
-                    partial_state_dict[p.original_name.replace('.default', '').replace('.modules_to_save', '')] = p.detach()
+                    save_source = getattr(p, 'ema_save_source', p)
+                    partial_state_dict[p.original_name.replace('.default', '').replace('.modules_to_save', '')] = save_source.detach()
                     if 'save_dtype' in self.config:
                         convert_state_dict_dtype(partial_state_dict, self.config['save_dtype'])
             torch.save(partial_state_dict, tmp_dir / f'state_dict_{stage_id}.bin')

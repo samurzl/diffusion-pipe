@@ -1,0 +1,78 @@
+# MiniMax H3 LoRA training with NSYNC and Self-Flow in the same optimizer step.
+# Fill in every path before running. See minimax_h3_nsync_self_flow_dataset.toml
+# for the required positive/generated-negative pairing.
+
+output_dir = 'path_to_output_dir'
+dataset = 'examples/minimax_h3_nsync_self_flow_dataset.toml'
+
+epochs = 1000
+micro_batch_size_per_gpu = 1
+image_micro_batch_size_per_gpu = 4
+pipeline_stages = 1
+gradient_accumulation_steps = 1  # logical steps; NSYNC internally executes 3 role microbatches
+gradient_clipping = 1
+warmup_steps = 10
+
+eval_before_first_step = false
+eval_every_n_epochs = 1
+eval_micro_batch_size_per_gpu = 1
+eval_gradient_accumulation_steps = 1
+
+save_every_n_epochs = 1
+checkpoint_every_n_minutes = 120  # checkpoints retain the Self-Flow EMA teacher and projection head
+activation_checkpointing = 'unsloth'
+partition_method = 'parameters'
+save_dtype = 'bfloat16'
+caching_batch_size = 1
+steps_per_print = 1
+video_clip_mode = 'single_beginning'
+blocks_to_swap = 48
+compile = false
+
+[model]
+type = 'minimax_h3'
+diffusion_model = '/path/to/minimax_h3_fl2va_pruned_int8_convrot.safetensors'
+vae = '/path/to/minimax_h3_video_vae_fp16.safetensors'
+audio_vae = '/path/to/minimax_h3_audio_vae_fp32.safetensors'
+text_encoders = [
+    {path = '/path/to/qwen3vl_32b_minimax_h3_int8_convrot.safetensors', type = 'minimax'}
+]
+dtype = 'bfloat16'
+timestep_sample_method = 'uniform'
+shift = 8
+image_shift = 1
+cfg = 1
+
+[adapter]
+type = 'lora'
+rank = 32
+dtype = 'bfloat16'
+
+[optimizer]
+type = 'adamw_optimi'
+lr = 1e-4
+betas = [0.9, 0.99]
+weight_decay = 0.01
+eps = 1e-8
+
+[training_methods.nsync]
+enabled = true
+eps = 1e-8
+
+[training_methods.self_flow]
+enabled = true
+gamma = 0.8
+ema_decay = 0.9999
+ema_dtype = 'float32'  # use bfloat16 only if the extra EMA precision does not fit in VRAM
+student_layer_ratio = 0.3
+teacher_layer_ratio = 0.7
+projection_dim = 1024
+image_mask_ratio = 0.25
+video_mask_ratio = 0.10
+audio_mask_ratio = 0.50
+# Adapted from the Self-Flow video ablation: retain a small explicitly
+# very-low-SNR fraction when the ordinary schedule undersamples that region.
+high_noise_fraction = 0.05
+high_noise_range = [0.95, 1.0]
+video_loss_weight = 1.0
+audio_loss_weight = 1.0

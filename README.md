@@ -13,6 +13,8 @@ Models supported: SDXL, Flux, LTX-Video, HunyuanVideo (t2v), Cosmos, Lumina Imag
 - Easily add new models by implementing a single subclass
 
 ## Recent changes
+- 2026-08-10
+  - Add NSYNC and Self-Flow LoRA training for MiniMax H3, including combined NSYNC + Self-Flow runs for joint video/audio training.
 - 2026-08-08
   - Add CFG-augmented training for MiniMax H3. You need to enable it, see the example TOML file. You probably always want to use either this, or a training adapter.
 - 2026-08-06

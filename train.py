@@ -142,6 +142,26 @@ def set_config_defaults(config):
     config.setdefault('compile', False)
     config.setdefault('x_axis_examples', False)
 
+    training_methods = config.setdefault('training_methods', {})
+    nsync_config = training_methods.setdefault('nsync', {})
+    self_flow_config = training_methods.setdefault('self_flow', {})
+    nsync_config.setdefault('enabled', False)
+    self_flow_config.setdefault('enabled', False)
+    if nsync_config['enabled'] or self_flow_config['enabled']:
+        if model_config['type'] != 'minimax_h3':
+            raise ValueError('NSYNC and Self-Flow are currently implemented specifically for model.type=minimax_h3')
+        if config.get('adapter', {}).get('type') != 'lora':
+            raise ValueError('NSYNC and Self-Flow currently require LoRA adapter training')
+        if config['compile']:
+            print('Disabling torch.compile because NSYNC/Self-Flow use backward hooks and runtime LoRA adapter selection')
+            config['compile'] = False
+    if nsync_config['enabled'] and config['optimizer'].get('gradient_release', False):
+        raise ValueError('NSYNC gradient surgery is incompatible with optimizer.gradient_release')
+    if nsync_config['enabled'] and config.get('uncond_fraction', 0.0) != 0:
+        raise ValueError('NSYNC requires uncond_fraction=0 so paired positive and negative prompts stay identical')
+    if self_flow_config['enabled'] and config['pipeline_stages'] != 1:
+        raise ValueError('Self-Flow currently requires pipeline_stages=1 because its EMA teacher branch is forward-only')
+
 
 def get_most_recent_run_dir(output_dir):
     return list(sorted(glob.glob(os.path.join(output_dir, '*'))))[-1]
@@ -420,9 +440,14 @@ if __name__ == '__main__':
     default_micro_batch_size_per_gpu = list(micro_batch_size_per_gpu.values())[0]
 
     gradient_release = config['optimizer'].get('gradient_release', False)
+    logical_gradient_accumulation_steps = config.get('gradient_accumulation_steps', 1)
+    nsync_enabled = config['training_methods']['nsync']['enabled']
+    # NSYNC executes positive, negative, and anchor as sequential microbatches,
+    # followed by one projected optimizer update.
+    engine_gradient_accumulation_steps = logical_gradient_accumulation_steps * (3 if nsync_enabled else 1)
     ds_config = {
         'train_micro_batch_size_per_gpu': default_micro_batch_size_per_gpu,
-        'gradient_accumulation_steps': config.get('gradient_accumulation_steps', 1),
+        'gradient_accumulation_steps': engine_gradient_accumulation_steps,
         # Can't do gradient clipping with gradient release, since there are no grads at the end of the step anymore.
         'gradient_clipping': 0. if gradient_release else config.get('gradient_clipping', 1.0),
         'steps_per_print': config.get('steps_per_print', 1),
@@ -431,6 +456,11 @@ if __name__ == '__main__':
     dataset_manager = dataset_util.DatasetManager(model, regenerate_cache=regenerate_cache, trust_cache=args.trust_cache, caching_batch_size=caching_batch_size, keep_models_loaded=args.test_sample)
 
     train_data = dataset_util.Dataset(dataset_config, model, skip_dataset_validation=args.i_know_what_i_am_doing)
+    if nsync_enabled and not train_data.nsync_enabled:
+        raise ValueError(
+            'NSYNC is enabled, but the training dataset has no paired nsync_role directories. '
+            'See examples/minimax_h3_nsync_self_flow_dataset.toml.'
+        )
     dataset_manager.register(train_data)
 
     eval_data_map = {}
@@ -533,6 +563,8 @@ if __name__ == '__main__':
         is_adapter = True
         if init_from_existing := adapter_config.get('init_from_existing', None):
             model.load_adapter_weights(init_from_existing)
+            if hasattr(model, 'sync_self_flow_teacher'):
+                model.sync_self_flow_teacher()
     else:
         is_adapter = False
 
@@ -615,7 +647,10 @@ if __name__ == '__main__':
         **additional_pipeline_module_kwargs
     )
     model.pipeline_model = pipeline_model
-    parameters_to_train = [p for p in pipeline_model.parameters() if p.requires_grad]
+    parameters_to_train = [
+        p for p in pipeline_model.parameters()
+        if p.requires_grad and not getattr(p, 'is_ema_teacher', False)
+    ]
 
     if config['compile']:
         pipeline_model.compile(dynamic=True)
@@ -629,7 +664,7 @@ if __name__ == '__main__':
     # parallelism has always relied on "Torch-style" backward(), so I think this is an oversight by Deepspeed devs and it's safe
     # to force this to True to get it to work.
     model_engine._support_torch_style_backward = True
-    global_batch_size = model_engine.train_micro_batch_size_per_gpu() * model_engine.gradient_accumulation_steps() * model_engine.grid.get_data_parallel_world_size()
+    global_batch_size = model_engine.train_micro_batch_size_per_gpu() * logical_gradient_accumulation_steps * model_engine.grid.get_data_parallel_world_size()
     print(f'Global batch size = {global_batch_size}')
 
     if args.test_sample:
@@ -818,6 +853,13 @@ if __name__ == '__main__':
     optimizer = model_engine.optimizer
 
     model.model_engine = model_engine
+    if nsync_enabled and model_engine.grid.get_data_parallel_world_size() != 1:
+        raise ValueError(
+            'NSYNC currently requires data parallel world size 1. Pipeline parallelism is supported; '
+            'set pipeline_stages equal to the number of GPUs.'
+        )
+    if hasattr(model, 'wrap_model_engine'):
+        model.wrap_model_engine(model_engine)
     if model_engine.is_pipe_parallel:
          grid = model_engine.grid
          model_engine.first_last_stage_group = dist.new_group(ranks=[grid.pp_group[0], grid.pp_group[-1]])
@@ -826,7 +868,7 @@ if __name__ == '__main__':
         model_engine.grid.get_data_parallel_rank(),
         model_engine.grid.get_data_parallel_world_size(),
         micro_batch_size_per_gpu,
-        model_engine.gradient_accumulation_steps(),
+        logical_gradient_accumulation_steps,
         image_micro_batch_size_per_gpu,
     )
     for eval_data in eval_data_map.values():
@@ -929,10 +971,17 @@ if __name__ == '__main__':
             tb_writer.add_scalar(f'train/loss', loss, x_axis)
             if hasattr(optimizer, '_grad_norm'):
                 tb_writer.add_scalar(f'train/grad_norm', optimizer._grad_norm, x_axis)
+            if hasattr(model, 'last_nsync_stats'):
+                for name, value in model.last_nsync_stats.items():
+                    tb_writer.add_scalar(f'train/nsync_{name}', value, x_axis)
             if wandb_enable:
-                wandb.log({'train/loss': loss, 'step': x_axis})
+                log_values = {'train/loss': loss, 'step': x_axis}
                 if hasattr(optimizer, '_grad_norm'):
-                    wandb.log({'train/grad_norm': optimizer._grad_norm, 'step': x_axis})
+                    log_values['train/grad_norm'] = optimizer._grad_norm
+                if hasattr(model, 'last_nsync_stats'):
+                    for name, value in model.last_nsync_stats.items():
+                        log_values[f'train/nsync_{name}'] = value
+                wandb.log(log_values)
             if optimizer.__class__.__name__ == 'Prodigy':
                 prodigy_d = get_prodigy_d(optimizer)
                 tb_writer.add_scalar(f'train/prodigy_d', prodigy_d, x_axis)

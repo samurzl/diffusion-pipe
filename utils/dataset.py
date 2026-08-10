@@ -25,6 +25,7 @@ from tqdm import tqdm
 
 from utils.common import is_main_process, VIDEO_EXTENSIONS, round_to_nearest_multiple
 from utils.cache import Cache
+from utils.nsync import NSYNC_POSITIVE, NSYNC_NEGATIVE, NSYNC_ANCHOR
 import comfy.model_management as mm
 
 
@@ -395,6 +396,125 @@ class ConcatenatedBatchedDataset:
             logger.warning(f"size bucket {self.datasets[0].size_bucket} is being completely dropped because it doesn't have enough images")
 
 
+class NSYNCBatchedDataset:
+    """Return role-homogeneous NSYNC microbatches from a paired size bucket.
+
+    The positive and generated-negative media are paired by filename stem and
+    caption number. The returned flat batch is ordered as
+    ``positive, negative, anchor`` for every logical accumulation microbatch;
+    ``PipelineDataLoader`` then splits it into those role-homogeneous pieces.
+    """
+
+    def __init__(self, positive, negative, pair_name):
+        if positive.size_bucket != negative.size_bucket:
+            raise ValueError(f'NSYNC pair {pair_name!r} has mismatched size buckets')
+        self.positive = positive
+        self.negative = negative
+        self.pair_name = pair_name
+        self.size_bucket = positive.size_bucket
+        self.post_init_called = False
+
+        self.negative_lookup = {}
+        for index, entry in enumerate(self.negative.iteration_order):
+            key = self._entry_key(entry)
+            if key in self.negative_lookup:
+                raise ValueError(f'NSYNC negative pair {pair_name!r} contains duplicate key {key}')
+            self.negative_lookup[key] = index
+
+        missing = []
+        for entry in self.positive.iteration_order:
+            key = self._entry_key(entry)
+            if key not in self.negative_lookup:
+                missing.append(key)
+        if missing:
+            preview = ', '.join(str(key) for key in missing[:5])
+            raise ValueError(
+                f'NSYNC pair {pair_name!r} is missing {len(missing)} generated negatives. '
+                f'First missing keys: {preview}'
+            )
+
+    @staticmethod
+    def _entry_key(entry):
+        image_spec = entry['image_spec']
+        return Path(image_spec[-1]).stem, int(entry['caption_number'])
+
+    def post_init(self, global_batch_size, data_parallel_rank, data_parallel_world_size, gradient_accumulation_steps):
+        if global_batch_size % data_parallel_world_size != 0:
+            raise ValueError('NSYNC global batch size must be divisible by data parallel world size')
+        self.data_parallel_rank = data_parallel_rank
+        self.data_parallel_world_size = data_parallel_world_size
+        self.global_batch_size = global_batch_size
+        self.local_batch_size = global_batch_size // data_parallel_world_size
+        self.gradient_accumulation_steps = gradient_accumulation_steps
+        if self.local_batch_size % gradient_accumulation_steps != 0:
+            raise ValueError('NSYNC local batch size must be divisible by gradient_accumulation_steps')
+        self.micro_batch_size = self.local_batch_size // gradient_accumulation_steps
+
+        self.iteration_order = np.arange(len(self.positive))
+        shuffle_with_seed(self.iteration_order, seed_from_hash(('nsync', self.pair_name, self.size_bucket)))
+        # The anchor is a second, independently shuffled draw from the positive
+        # distribution, rather than another view of the paired positive item.
+        self.anchor_iteration_order = np.arange(len(self.positive))
+        shuffle_with_seed(
+            self.anchor_iteration_order,
+            seed_from_hash(('nsync-anchor', self.pair_name, self.size_bucket)),
+        )
+        new_length = (len(self.iteration_order) // global_batch_size) * global_batch_size
+        self.iteration_order = self.iteration_order[:new_length]
+        self.anchor_iteration_order = self.anchor_iteration_order[:new_length]
+        if new_length == 0 and is_main_process():
+            logger.warning(
+                f'NSYNC size bucket {self.size_bucket} for pair {self.pair_name!r} is being dropped '
+                'because it does not contain a complete logical batch'
+            )
+        self.post_init_called = True
+
+    def __len__(self):
+        assert self.post_init_called
+        return len(self.iteration_order) // self.global_batch_size
+
+    @staticmethod
+    def _with_role(example, role):
+        example = dict(example)
+        example['nsync_role'] = torch.tensor(role, dtype=torch.int64)
+        return example
+
+    def __getitem__(self, idx):
+        assert self.post_init_called
+        start = idx * self.global_batch_size + self.data_parallel_rank * self.local_batch_size
+        positive_indices = self.iteration_order[start:start + self.local_batch_size]
+        anchor_indices = self.anchor_iteration_order[start:start + self.local_batch_size]
+        examples = []
+        base_positive_length = len(self.positive.iteration_order)
+
+        for offset in range(0, self.local_batch_size, self.micro_batch_size):
+            micro_indices = positive_indices[offset:offset + self.micro_batch_size]
+            micro_anchor_indices = anchor_indices[offset:offset + self.micro_batch_size]
+            positives, negatives, anchors = [], [], []
+            for positive_index, anchor_index in zip(micro_indices, micro_anchor_indices):
+                positive_index = int(positive_index)
+                anchor_index = int(anchor_index)
+                positive_entry = self.positive.iteration_order[positive_index % base_positive_length]
+                key = self._entry_key(positive_entry)
+                negative_index = self.negative_lookup[key]
+
+                positive = self.positive[positive_index]
+                negative = self.negative[negative_index]
+                anchor = self.positive[anchor_index]
+                if positive['caption'] != negative['caption']:
+                    raise ValueError(
+                        f'NSYNC pair {self.pair_name!r} has different captions for {key}: '
+                        f'{positive["caption"]!r} != {negative["caption"]!r}'
+                    )
+                positives.append(self._with_role(positive, NSYNC_POSITIVE))
+                negatives.append(self._with_role(negative, NSYNC_NEGATIVE))
+                anchors.append(self._with_role(anchor, NSYNC_ANCHOR))
+            examples.extend(positives)
+            examples.extend(negatives)
+            examples.extend(anchors)
+        return examples
+
+
 class ARBucketDataset:
     def __init__(self, ar_frames, resolutions, metadata_dataset, directory_config, cache_base, round_to_multiple, directory_dataset):
         self.ar_frames = ar_frames
@@ -474,6 +594,9 @@ class DirectoryDataset:
         self.directory_config['cache_shuffle_num'] = self.shuffle # Make accessible if it wasn't yet, for picking one out
         self.shuffle_delimiter = directory_config.get('cache_shuffle_delimiter', dataset_config.get('cache_shuffle_delimiter', ", "))
         self.path = Path(self.directory_config['path'])
+        # NSYNC negatives normally reuse the captions of their paired positive
+        # examples, so captions may intentionally live outside the media folder.
+        self.caption_path = Path(self.directory_config.get('caption_path', self.path))
         self.mask_path = Path(self.directory_config['mask_path']) if 'mask_path' in self.directory_config else None
         self.control_path = Path(self.directory_config['control_path']) if 'control_path' in self.directory_config else None
         # For testing. Default if a mask is missing.
@@ -484,6 +607,8 @@ class DirectoryDataset:
 
         if not self.path.exists() or not self.path.is_dir():
             raise RuntimeError(f'Invalid path: {self.path}')
+        if not self.caption_path.exists() or not self.caption_path.is_dir():
+            raise RuntimeError(f'Invalid caption_path: {self.caption_path}')
         if self.mask_path is not None and (not self.mask_path.exists() or not self.mask_path.is_dir()):
             raise RuntimeError(f'Invalid mask_path: {self.mask_path}')
         if self.control_path is not None and (not self.control_path.exists() or not self.control_path.is_dir()):
@@ -513,7 +638,7 @@ class DirectoryDataset:
 
         online_captions = directory_config.get('online_captions', dataset_config.get('online_captions', False))
         if online_captions:
-            captions_json = self.path / CAPTIONS_JSON_FILE
+            captions_json = self.caption_path / CAPTIONS_JSON_FILE
             assert captions_json.exists()
             with open(captions_json) as f:
                 self.captions_dict = json.load(f)
@@ -638,7 +763,7 @@ class DirectoryDataset:
                 with tarfile.TarFile(file) as tar_f:
                     return [(str(file), name) for name in tar_f.getnames()]
 
-            captions_json = self.path / CAPTIONS_JSON_FILE
+            captions_json = self.caption_path / CAPTIONS_JSON_FILE
             has_captions_json = captions_json.exists()
 
             image_specs = []
@@ -650,7 +775,7 @@ class DirectoryDataset:
                     continue
                 for image_spec in process_file(file):
                     image_file = Path(image_spec[1])
-                    caption_file = image_file.with_suffix('.txt')
+                    caption_file = (self.caption_path / image_file.name).with_suffix('.txt')
                     if has_captions_json or not os.path.exists(caption_file):
                         caption_file = ''
                     image_specs.append(image_spec)
@@ -938,7 +1063,10 @@ class Dataset:
             self.model.model_specific_dataset_config_validation(self.dataset_config)
 
         self.directory_datasets = []
+        nsync_roles_present = []
         for directory_config in dataset_config['directory']:
+            if 'nsync_role' in directory_config:
+                nsync_roles_present.append(directory_config['nsync_role'])
             directory_dataset = DirectoryDataset(
                 directory_config,
                 dataset_config,
@@ -948,6 +1076,16 @@ class Dataset:
                 skip_dataset_validation=skip_dataset_validation,
             )
             self.directory_datasets.append(directory_dataset)
+        self.nsync_enabled = len(nsync_roles_present) > 0
+        if self.nsync_enabled:
+            if not getattr(model, 'nsync_enabled', False):
+                raise ValueError('Dataset contains nsync_role entries, but NSYNC is not enabled in the training config')
+            valid_roles = {'positive', 'negative'}
+            invalid_roles = set(nsync_roles_present) - valid_roles
+            if invalid_roles:
+                raise ValueError(f'Unknown nsync_role values: {sorted(invalid_roles)}')
+            if len(nsync_roles_present) != len(dataset_config['directory']):
+                raise ValueError('Every directory in an NSYNC dataset must define nsync_role')
 
     def post_init(self, data_parallel_rank, data_parallel_world_size, per_device_batch_size: dict, gradient_accumulation_steps, per_device_batch_size_image: dict):
         self.data_parallel_rank = data_parallel_rank
@@ -955,17 +1093,50 @@ class Dataset:
         global_batch_size = {size: bs * gradient_accumulation_steps * self.data_parallel_world_size for size, bs in per_device_batch_size.items()}
         global_batch_size_image = {size: bs * gradient_accumulation_steps * self.data_parallel_world_size for size, bs in per_device_batch_size_image.items()}
 
-        # group same size_bucket together
-        datasets_by_size_bucket = defaultdict(list)
-        for directory_dataset in self.directory_datasets:
-            for size_bucket_dataset in directory_dataset.get_size_bucket_datasets():
-                datasets_by_size_bucket[size_bucket_dataset.size_bucket].append(size_bucket_dataset)
         self.buckets = []
-        for datasets in datasets_by_size_bucket.values():
-            self.buckets.append(ConcatenatedBatchedDataset(datasets))
+        if self.nsync_enabled:
+            datasets_by_pair_and_bucket = defaultdict(lambda: defaultdict(list))
+            for directory_dataset in self.directory_datasets:
+                directory_config = directory_dataset.directory_config
+                pair = directory_config.get('nsync_pair', 'default')
+                role = directory_config['nsync_role']
+                for size_bucket_dataset in directory_dataset.get_size_bucket_datasets():
+                    datasets_by_pair_and_bucket[(pair, tuple(size_bucket_dataset.size_bucket))][role].append(size_bucket_dataset)
 
-        for bucket in self.buckets:
-            bucket.post_init(global_batch_size, global_batch_size_image, data_parallel_rank, data_parallel_world_size)
+            for (pair, size_bucket), role_datasets in datasets_by_pair_and_bucket.items():
+                positives = role_datasets.get('positive', [])
+                negatives = role_datasets.get('negative', [])
+                if len(positives) != 1 or len(negatives) != 1:
+                    raise ValueError(
+                        f'NSYNC pair {pair!r}, bucket {size_bucket} requires exactly one positive and one negative '
+                        f'dataset, found {len(positives)} positive and {len(negatives)} negative'
+                    )
+                bucket = NSYNCBatchedDataset(positives[0], negatives[0], pair)
+                batch_size_dict = global_batch_size_image if size_bucket[-1] == 1 else global_batch_size
+                if None in batch_size_dict:
+                    bucket_global_batch_size = batch_size_dict[None]
+                else:
+                    bucket_size = math.sqrt(size_bucket[-2] * size_bucket[-3])
+                    closest_size = min(batch_size_dict, key=lambda value: abs(value - bucket_size))
+                    bucket_global_batch_size = batch_size_dict[closest_size]
+                bucket.post_init(
+                    bucket_global_batch_size,
+                    data_parallel_rank,
+                    data_parallel_world_size,
+                    gradient_accumulation_steps,
+                )
+                self.buckets.append(bucket)
+        else:
+            # group same size_bucket together
+            datasets_by_size_bucket = defaultdict(list)
+            for directory_dataset in self.directory_datasets:
+                for size_bucket_dataset in directory_dataset.get_size_bucket_datasets():
+                    datasets_by_size_bucket[size_bucket_dataset.size_bucket].append(size_bucket_dataset)
+            for datasets in datasets_by_size_bucket.values():
+                self.buckets.append(ConcatenatedBatchedDataset(datasets))
+
+            for bucket in self.buckets:
+                bucket.post_init(global_batch_size, global_batch_size_image, data_parallel_rank, data_parallel_world_size)
 
         iteration_order = []
         for i, bucket in enumerate(self.buckets):
