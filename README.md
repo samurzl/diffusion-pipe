@@ -15,6 +15,7 @@ Models supported: SDXL, Flux, LTX-Video, HunyuanVideo (t2v), Cosmos, Lumina Imag
 ## Recent changes
 - 2026-08-10
   - Add NSYNC and Self-Flow LoRA training for MiniMax H3, including combined NSYNC + Self-Flow runs for joint video/audio training.
+  - Add a local-ComfyUI utility for generating caption-matched MiniMax H3 NSYNC negative datasets from positive media.
 - 2026-08-08
   - Add CFG-augmented training for MiniMax H3. You need to enable it, see the example TOML file. You probably always want to use either this, or a training adapter.
 - 2026-08-06
@@ -106,6 +107,25 @@ Most dependencies are intentionally left unpinned in the requirements.txt file. 
 A dataset consists of one or more directories containing image or video files, and corresponding captions. You can mix images and videos in the same directory, but it's probably a good idea to separate them in case you need to specify certain settings on a per-directory basis. Caption files should be .txt files with the same base name as the corresponding media file, e.g. image1.png should have caption file image1.txt in the same directory. If a media file doesn't have a matching caption file, a warning is printed, but training will proceed with an empty caption.
 
 For images, any image format that can be loaded by Pillow should work. For videos, any format that can be loaded by ImageIO should work. Note that this means **WebP videos are not supported**, because ImageIO can't load multi-frame WebPs.
+
+## MiniMax H3 NSYNC negative generation
+
+MiniMax H3 NSYNC training needs a generated negative for every positive image or video. [`tools/generate_minimax_h3_nsync_negatives.py`](./tools/generate_minimax_h3_nsync_negatives.py) automates this using a **locally running MiniMax H3 ComfyUI workflow**. It does not use the hosted MiniMax API and rejects ComfyUI partner/API MiniMax nodes.
+
+The utility reads positive `.txt` captions or `captions.json`, removes the target trigger/style text from the generation prompt, queues the local H3 workflow, and writes same-stem negative media. It also normalizes dimensions, frame count/duration, media type, and audio presence so the files pair correctly during NSYNC training.
+
+Start with a dry run:
+
+```bash
+python tools/generate_minimax_h3_nsync_negatives.py \
+  /path/to/target_positive_media \
+  /path/to/generated_negative_media \
+  --workflow /path/to/minimax_h3_t2va_api.json \
+  --remove-text 'your trigger or target style' \
+  --dry-run
+```
+
+Remove `--dry-run` to generate. The ComfyUI workflow must be exported in API format, use the local `MiniMaxH3ImageToVideo` node without first/last-frame or reference conditioning, and save one decoded result through `SaveVideo`. See the [complete local ComfyUI negative-generation guide](./docs/minimax_h3_nsync_negative_generation.md), the [MiniMax H3 training notes](./docs/minimax_h3_notes.md), and the [paired dataset example](./examples/minimax_h3_nsync_self_flow_dataset.toml).
 
 ## Supported models
 See the [supported models doc](./docs/supported_models.md) for more information on how to configure each model, the options it supports, and the format of the saved LoRAs.

@@ -1,6 +1,15 @@
 # NSYNC requires one positive and one generated-negative directory for each
 # nsync_pair and size bucket. Files are paired by stem (shot_001.mp4 pairs with
 # shot_001.mp4 or shot_001.<another-supported-extension>).
+# tools/generate_minimax_h3_nsync_negatives.py can create the negative directory
+# through a locally running MiniMax H3 ComfyUI workflow. Full guide:
+# docs/minimax_h3_nsync_negative_generation.md
+#
+# Preview generation before starting:
+# python tools/generate_minimax_h3_nsync_negatives.py \
+#   /path/to/target_positive_media /path/to/generated_negative_media \
+#   --workflow /path/to/minimax_h3_t2va_api.json \
+#   --remove-text 'your target trigger or style' --dry-run
 
 resolutions = [512]
 enable_ar_bucket = true
@@ -18,7 +27,8 @@ nsync_pair = 'target_style'
 [[directory]]
 path = '/path/to/generated_negative_media'
 # Reuse the paired positive caption files. Each negative must express the same
-# caption/content while omitting the target concept or style.
+# caption/content while omitting the target concept or style. Do not point this
+# at cleaned generation prompts; NSYNC requires exact positive training captions.
 caption_path = '/path/to/target_positive_media'
 num_repeats = 1
 nsync_role = 'negative'

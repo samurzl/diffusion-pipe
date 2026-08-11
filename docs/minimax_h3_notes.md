@@ -48,6 +48,23 @@ Use [minimax_h3_nsync_self_flow_dataset.toml](../examples/minimax_h3_nsync_self_
 - The generated negative should preserve the caption's subject/content while omitting the target concept or style. The trainer does not synthesize negatives for you.
 - NSYNC currently requires data-parallel world size 1, `uncond_fraction = 0`, and no `optimizer.gradient_release`. NSYNC by itself can use pipeline parallelism.
 
+### Generating N-Sync negatives with local MiniMax H3 in ComfyUI
+
+Use [`tools/generate_minimax_h3_nsync_negatives.py`](../tools/generate_minimax_h3_nsync_negatives.py) to create the negative directory through a locally running MiniMax H3 ComfyUI workflow. It rejects hosted MiniMax API nodes, removes target phrases from generation prompts, preserves positive filename stems, and normalizes dimensions, frame duration, media type, and audio presence.
+
+The [complete local ComfyUI NSYNC negative-generation guide](minimax_h3_nsync_negative_generation.md) covers workflow construction, caption handling, dry runs, resuming, all important options, dataset configuration, and troubleshooting. The basic command is:
+
+```bash
+python tools/generate_minimax_h3_nsync_negatives.py \
+  /path/to/target_positive_media \
+  /path/to/generated_negative_media \
+  --workflow /path/to/minimax_h3_t2va_api.json \
+  --remove-text 'your trigger phrase' \
+  --dry-run
+```
+
+Remove `--dry-run` after checking every cleaned prompt. Keep the negative dataset's `caption_path` pointed at the positive directory so training uses the exact positive caption, not the cleaned generation prompt.
+
 ## Self-Flow LoRA training
 
 [Self-Flow](https://arxiv.org/abs/2603.06507) trains a student on a sequence where randomly selected tokens use an independent timestep `s` and all other tokens use `t`. An EMA teacher receives the homogeneous, cleaner state at `min(t, s)`. A train-only projection MLP aligns the student representation near 30% depth with the teacher representation near 70% depth using negative cosine similarity. The normal flow-matching loss remains active.

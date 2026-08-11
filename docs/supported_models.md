@@ -650,4 +650,6 @@ cfg = 4
 ```
 There is a document for [MiniMax H3 notes](minimax_h3_notes.md). Read the whole thing before you train. Also look at the [standard MiniMax H3 example](../examples/minimax_h3_example.toml) or the [combined NSYNC + Self-Flow example](../examples/minimax_h3_nsync_self_flow.toml).
 
+NSYNC requires caption-matched, same-stem generated negatives. The [local ComfyUI NSYNC negative-generation guide](minimax_h3_nsync_negative_generation.md) explains how to create them automatically with `tools/generate_minimax_h3_nsync_negatives.py`, validate the media pairing, and connect the output to the [paired dataset configuration](../examples/minimax_h3_nsync_self_flow_dataset.toml). The generator accepts only local MiniMax H3 workflows and rejects hosted MiniMax API nodes.
+
 Everything is ComfyUI format, including the saved models. You can now train LoRAs directly on quantized models, and it is recommended to use int8 convrot (faster, better quality, and less VRAM).

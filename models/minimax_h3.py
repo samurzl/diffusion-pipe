@@ -209,6 +209,22 @@ class MinimaxH3Pipeline(ComfyPipeline):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self.mode = self.model_config.get('mode', 't2v').lower()
+        if self.mode not in ('t2v', 'i2v'):
+            raise ValueError(f'MiniMax H3 model.mode must be t2v or i2v, got {self.mode!r}')
+        self.i2v = self.mode == 'i2v'
+        if self.i2v:
+            # Keep I2V caches separate from older T2V caches. I2V adds both a
+            # separately encoded first-frame latent and Qwen vision tokens.
+            self.name = 'minimax_h3_i2v'
+        self.i2v_visual_cond_timestep = float(
+            self.model_config.get('i2v_visual_cond_timestep', 0.999)
+        )
+        if not 0 <= self.i2v_visual_cond_timestep <= 1:
+            raise ValueError(
+                'MiniMax H3 model.i2v_visual_cond_timestep must be in [0, 1], '
+                f'got {self.i2v_visual_cond_timestep}'
+            )
         self.is_video_vae = True
         self.latent_format = comfy.latent_formats.MiniMaxH3Video()
         self.offloader = ModelOffloader('dummy', [], 0, 0, True, torch.device('cuda'), False, debug=False)
@@ -464,6 +480,58 @@ class MinimaxH3Pipeline(ComfyPipeline):
     def get_preprocess_media_file_fn(self):
         return PreprocessMediaFileMinimax(self.config)
 
+    def get_call_text_encoder_fn(self, text_encoder):
+        if not self.i2v:
+            return super().get_call_text_encoder_fn(text_encoder)
+
+        te_idx = None
+        for index, candidate in enumerate(self.text_encoders):
+            if text_encoder == candidate:
+                te_idx = index
+                break
+        if te_idx is None:
+            raise RuntimeError('Unknown text encoder')
+
+        @torch.inference_mode()
+        def fn(captions: list[str], is_video: list[bool], media: list):
+            if len(captions) != len(media):
+                raise ValueError('MiniMax H3 I2V text caching received mismatched captions and media')
+
+            text_embeds, attention_masks, token_tags = [], [], []
+            for caption, video, first_frame in zip(captions, is_video, media):
+                images = [first_frame] if video else []
+                if video and first_frame is None:
+                    raise ValueError('MiniMax H3 I2V video is missing its first-frame text conditioning')
+
+                tokens = text_encoder.tokenize(caption, images=images)
+                encoded = text_encoder.encode_from_tokens_scheduled(tokens)
+                embeds = encoded[0][0][0].to(self.dtype)
+                extra = encoded[0][1]
+                tags = extra.get('minimax_token_tags')
+                if tags is None:
+                    tags = torch.ones(embeds.shape[0], dtype=torch.int64, device=embeds.device)
+                else:
+                    tags = tags.to(device=embeds.device, dtype=torch.int64).reshape(-1)
+                    if tags.shape[0] != embeds.shape[0]:
+                        raise RuntimeError(
+                            'MiniMax H3 text token tags did not match the expanded multimodal sequence: '
+                            f'{tags.shape[0]} tags for {embeds.shape[0]} embeddings'
+                        )
+
+                text_embeds.append(embeds)
+                attention_masks.append(torch.ones(embeds.shape[0], dtype=torch.int64, device=embeds.device))
+                token_tags.append(tags)
+
+            # Lists intentionally preserve variable sequence lengths. The
+            # dataset cache unbatches them into one tensor per example.
+            return {
+                f'text_embeds_{te_idx}': text_embeds,
+                f'attention_mask_{te_idx}': attention_masks,
+                f'minimax_token_tags_{te_idx}': token_tags,
+            }
+
+        return fn
+
     def vae_encode(self, img: torch.Tensor, audio: list):
         video_vae, audio_vae = self.vae._model
         # move channel dim to end
@@ -494,7 +562,24 @@ class MinimaxH3Pipeline(ComfyPipeline):
                     print(f'WARNING: this batch had {missing_audio} videos without audio. The videos could have no audio track, or it could be a bug in the code.')
             images = images.to('cuda', self.dtype)
             latents, audio_latents = self.vae_encode(images, audio)
-            return {'latents': latents, 'audio_latents': audio_latents}
+            result = {'latents': latents, 'audio_latents': audio_latents}
+            if self.i2v:
+                if images.shape[2] > 1:
+                    # ComfyUI FL2VA encodes the keyframe independently. A
+                    # slice of the full video latent is not equivalent because
+                    # the H3 VAE's temporal path sees neighboring frames.
+                    first_frame_latents, _ = self.vae_encode(
+                        images[:, :, 0], [None] * images.shape[0]
+                    )
+                    result['i2v_first_frame_latents'] = first_frame_latents.unsqueeze(2)
+                else:
+                    # Images remain ordinary T2I/T2V-mode examples even when
+                    # the run is configured for I2V. The empty temporal axis is
+                    # a batchable sentinel consumed by prepare_inputs().
+                    result['i2v_first_frame_latents'] = latents.new_empty(
+                        (latents.shape[0], latents.shape[1], 0, latents.shape[-2], latents.shape[-1])
+                    )
+            return result
         return fn
 
     def to_layers(self):
@@ -540,7 +625,15 @@ class MinimaxH3Pipeline(ComfyPipeline):
         )
         assert text_embeds.shape[:2] == attention_mask.shape[:2]
         attention_mask = attention_mask.to(torch.bool)
-        return text_embeds, attention_mask
+        if not self.i2v:
+            return text_embeds, attention_mask
+
+        token_tags = inputs['minimax_token_tags_0']
+        token_tags = torch.stack([
+            torch.cat([u, u.new_ones(max_seq_len - u.size(0))]) for u in token_tags
+        ]).to(torch.int64)
+        assert token_tags.shape == attention_mask.shape
+        return text_embeds, attention_mask, token_tags
 
     def _sample_timesteps(self, batch_size, device, frames, height, width, timestep_quantile=None):
         timestep_sample_method = self.model_config.get('timestep_sample_method', 'logit_normal')

@@ -1,6 +1,8 @@
 # MiniMax H3 LoRA training with NSYNC and Self-Flow in the same optimizer step.
 # Fill in every path before running. See minimax_h3_nsync_self_flow_dataset.toml
 # for the required positive/generated-negative pairing.
+# To generate those negatives with local MiniMax H3 in ComfyUI, follow
+# docs/minimax_h3_nsync_negative_generation.md.
 
 output_dir = 'path_to_output_dir'
 dataset = 'examples/minimax_h3_nsync_self_flow_dataset.toml'

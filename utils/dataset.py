@@ -1218,7 +1218,16 @@ class Dataset:
         self.model.uncond_dict = self.directory_datasets[0].uncond_dict
 
 
-def _cache_fn(datasets, queue, preprocess_media_file_fn, num_text_encoders, regenerate_cache, trust_cache, caching_batch_size):
+def _cache_fn(
+    datasets,
+    queue,
+    preprocess_media_file_fn,
+    num_text_encoders,
+    regenerate_cache,
+    trust_cache,
+    caching_batch_size,
+    te_fn_requires_media,
+):
     # Dataset map() starts a bunch of processes. Make sure torch uses a limited number of threads
     # to avoid CPU contention.
     # TODO: if we ever change Datasets map to use spawn instead of fork, this might not work.
@@ -1295,7 +1304,43 @@ def _cache_fn(datasets, queue, preprocess_media_file_fn, num_text_encoders, rege
                 pipes[rank] = mp.Pipe(duplex=False)
             parent_conn, child_conn = pipes[rank]
             control_file = example['control_file'] if 'control_file' in example else None
-            queue.put((text_encoder_idx+1, example['caption'], example['is_video'], control_file, child_conn))
+            media = None
+            if te_fn_requires_media[text_encoder_idx]:
+                media = []
+                for image_spec, mask_path, size_bucket, is_video in zip(
+                    example['image_spec'],
+                    example['mask_file'],
+                    example['size_bucket'],
+                    example['is_video'],
+                ):
+                    if not is_video:
+                        media.append(None)
+                        continue
+                    # Some multimodal text encoders need the first frame in
+                    # the exact crop/resize used for the corresponding latent.
+                    # This is deliberately done only for models that request
+                    # it; ordinary text-only caching remains unchanged.
+                    items = preprocess_media_file_fn(image_spec, None, size_bucket)
+                    if len(items) != 1:
+                        raise RuntimeError(
+                            f'Expected exactly one preprocessed clip for {image_spec}, got {len(items)}'
+                        )
+                    tensor = items[0][0]
+                    if tensor.ndim != 4 or tensor.shape[1] <= 1:
+                        raise RuntimeError(
+                            f'Expected a video tensor for I2V text conditioning, got {tensor.shape} for {image_spec}'
+                        )
+                    # [C, F, H, W] -> [1, H, W, C], as expected by ComfyUI's
+                    # multimodal tokenizers.
+                    media.append(tensor[:, 0].movedim(0, -1).unsqueeze(0))
+            queue.put((
+                text_encoder_idx + 1,
+                example['caption'],
+                example['is_video'],
+                control_file,
+                media,
+                child_conn,
+            ))
             result = parent_conn.recv()  # dict
             result['image_spec'] = example['image_spec']
             return result
@@ -1317,10 +1362,9 @@ class DatasetManager:
         self.call_vae_fn = self.model.get_call_vae_fn(self.vae)
         self.vae_supports_audio = 'audio' in signature(self.call_vae_fn).parameters
         self.call_text_encoder_fns = [self.model.get_call_text_encoder_fn(text_encoder) for text_encoder in self.text_encoders]
-        self.te_fn_requires_control_file = [
-            len(signature(fn).parameters) == 3
-            for fn in self.call_text_encoder_fns
-        ]
+        te_fn_parameters = [signature(fn).parameters for fn in self.call_text_encoder_fns]
+        self.te_fn_requires_control_file = ['control_file' in parameters for parameters in te_fn_parameters]
+        self.te_fn_requires_media = ['media' in parameters for parameters in te_fn_parameters]
         self.regenerate_cache = regenerate_cache
         self.trust_cache = trust_cache
         self.caching_batch_size = caching_batch_size
@@ -1355,6 +1399,7 @@ class DatasetManager:
                     self.regenerate_cache,
                     self.trust_cache,
                     self.caching_batch_size,
+                    self.te_fn_requires_media,
                 )
             )
             process.start()
@@ -1420,11 +1465,13 @@ class DatasetManager:
             else:
                 results = self.call_vae_fn(tensor, **kwargs)
         elif id > 0:
-            caption, is_video, control_file, pipe = task[1:]
+            caption, is_video, control_file, media, pipe = task[1:]
             args = [caption, is_video]
             idx = id - 1
             if self.te_fn_requires_control_file[idx]:
                 args.append(control_file)
+            if self.te_fn_requires_media[idx]:
+                args.append(media)
             results = self.call_text_encoder_fns[idx](*args)
         else:
             raise RuntimeError()
