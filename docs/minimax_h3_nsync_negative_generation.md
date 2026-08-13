@@ -1,6 +1,6 @@
 # Generating MiniMax H3 NSYNC negatives with local ComfyUI
 
-[`tools/generate_minimax_h3_nsync_negatives.py`](../tools/generate_minimax_h3_nsync_negatives.py) builds the paired generated-negative directory required by MiniMax H3 NSYNC training. ComfyUI runs the local MiniMax H3 model as the inference backend; the script only uses ComfyUI's local HTTP queue, history, and file endpoints.
+[`tools/generate_minimax_h3_nsync_negatives.py`](../tools/generate_minimax_h3_nsync_negatives.py) builds the paired generated-negative directory required by MiniMax H3 NSYNC training. ComfyUI runs the local MiniMax H3 model as the inference backend; the script only uses ComfyUI's local HTTP queue, history, and file endpoints. A ready API-format graph is included at [`examples/minimax_h3_t2va_api.json`](../examples/minimax_h3_t2va_api.json); the RunPod bootstrap patches its loader filenames to the model variants it finds in the existing ComfyUI.
 
 If you are starting with an empty GPU instance, use the [fresh RunPod MiniMax H3 NSYNC + Self-Flow guide](minimax_h3_nsync_self_flow_runpod.md) for the Pod template, installation, model downloads, ComfyUI setup, negative generation, caching, and training commands in one sequence.
 
@@ -30,7 +30,7 @@ The script does not copy rewritten prompts into the negative directory as captio
 ## Requirements
 
 - A locally running ComfyUI instance with local MiniMax H3 inference working.
-- An H3 text-to-video workflow exported in ComfyUI **API format**.
+- The bundled H3 API workflow, or another H3 text-to-video workflow exported in ComfyUI **API format**.
 - `ffmpeg` and `ffprobe` available on `PATH` or supplied through `--ffmpeg` and `--ffprobe`.
 - Positive media with same-stem `.txt` captions, or a standard `captions.json`.
 - Different positive and negative directories.
@@ -42,9 +42,17 @@ ffmpeg -version
 ffprobe -version
 ```
 
-## Build the local ComfyUI workflow
+## Use or customize the local ComfyUI workflow
 
-Create and successfully run the generation workflow once in ComfyUI before exporting it.
+For the standard setup, use the bundled workflow directly:
+
+```bash
+export H3_WORKFLOW_API=/workspace/workflows/minimax_h3_t2va_api.json
+```
+
+The RunPod setup script creates that runtime copy with the correct ComfyUI loader filenames. If using the standard model filenames without the bootstrap, use `examples/minimax_h3_t2va_api.json` directly. Continue to [Prepare the positive directory](#prepare-the-positive-directory) unless you need to customize sampling.
+
+To build a custom workflow, create and successfully run the generation graph once in ComfyUI before exporting it:
 
 1. Load the local MiniMax H3 diffusion model, video VAE, audio VAE, and MiniMax text encoder.
 2. Use `MiniMaxH3ImageToVideo` for the positive conditioning and empty AV latent.

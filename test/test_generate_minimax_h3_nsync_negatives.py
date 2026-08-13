@@ -9,6 +9,7 @@ from tools.generate_minimax_h3_nsync_negatives import (
     bind_local_h3_workflow,
     find_output_resource,
     fit_generation_dimensions,
+    load_api_workflow,
     make_generation_prompt,
     prepare_workflow,
     read_caption,
@@ -41,6 +42,29 @@ def local_h3_workflow():
 
 
 class GenerateMiniMaxH3NSyncNegativesTest(unittest.TestCase):
+    def test_bundled_api_workflow_is_ready_for_negative_generation(self):
+        workflow_path = Path(__file__).resolve().parents[1] / "examples" / "minimax_h3_t2va_api.json"
+        workflow = load_api_workflow(workflow_path)
+        binding = bind_local_h3_workflow(workflow)
+
+        self.assertEqual(binding.prompt_node, "5")
+        self.assertEqual(binding.shape_node, "5")
+        self.assertEqual(binding.output_node, "14")
+        self.assertNotIn("first_frame", workflow["5"]["inputs"])
+        self.assertNotIn("last_frame", workflow["5"]["inputs"])
+        self.assertEqual(workflow["13"]["inputs"]["fps"], 24.0)
+        self.assertEqual(workflow["14"]["class_type"], "SaveVideo")
+        self.assertEqual(workflow["13"]["inputs"]["audio"], ["12", 0])
+        self.assertEqual(workflow["14"]["inputs"]["video"], ["13", 0])
+        self.assertEqual(
+            sum(node["class_type"] == "SaveVideo" for node in workflow.values()),
+            1,
+        )
+        for node in workflow.values():
+            for value in node["inputs"].values():
+                if isinstance(value, list):
+                    self.assertIn(value[0], workflow)
+
     def test_bind_and_prepare_local_h3_workflow(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

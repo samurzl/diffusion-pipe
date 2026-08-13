@@ -78,7 +78,8 @@ If the Network Volume already contains ComfyUI and the H3 models, use [`tools/se
 - skips `pip` on later Pods when that venv is current and passes its import/CUDA check;
 - installs only missing container-level tools on each new Pod;
 - initializes diffusion-pipe's pinned ComfyUI **code submodule**, which its trainer imports independently of the existing ComfyUI application; and
-- writes `/workspace/minimax-h3-env.sh` with the discovered model paths and environment activation.
+- writes a ready-to-queue workflow at `/workspace/workflows/minimax_h3_t2va_api.json`, patched to the model variants it discovered; and
+- writes `/workspace/minimax-h3-env.sh` with the workflow path, discovered model paths, and environment activation.
 
 On the first Pod attached to the volume, install Git and clone diffusion-pipe if it is not already present:
 
@@ -174,7 +175,7 @@ export H3_AUDIO_VAE="$H3_MODEL_ROOT/vae/minimax_h3_audio_vae_fp32.safetensors"
 export H3_DATA_ROOT=/workspace/data/minimax-h3
 export H3_CONFIG_ROOT=/workspace/configs/minimax-h3
 export H3_OUTPUT_ROOT=/workspace/output/minimax-h3-nsync-self-flow
-export H3_WORKFLOW_API=/workspace/workflows/minimax_h3_t2va_api.json
+export H3_WORKFLOW_API="$DP_ROOT/examples/minimax_h3_t2va_api.json"
 ```
 
 ## 4. Create the Python environment
@@ -376,33 +377,19 @@ curl --fail http://127.0.0.1:8188/system_stats | jq '.system, .devices'
 
 In RunPod, open **Connect > HTTP Service [Port 8188]**.
 
-### One-time workflow preparation
+### Use the ready API workflow
 
-The generator queues an API-format workflow, so prepare it once:
+The repository includes [`examples/minimax_h3_t2va_api.json`](../examples/minimax_h3_t2va_api.json). It is already in ComfyUI API format and contains local text-only H3 conditioning, the official sampler/schedule, video and audio decoding, 24 fps muxing, and exactly one `SaveVideo` output. It has no first-frame, last-frame, reference, or hosted MiniMax API connections.
 
-1. In ComfyUI, choose **Workflow > Browse Templates** and load the official **MiniMax H3 Text to Video** template. If it is not listed, download and open Comfy-Org's [official H3 T2V workflow](https://github.com/Comfy-Org/workflow_templates/blob/main/templates/video_minimax_h3_t2v.json).
-2. In **Load Diffusion Model**, select `minimax_h3_fl2va_pruned_int8_convrot.safetensors`.
-3. In **Load CLIP**, select `qwen3vl_32b_minimax_h3_int8_convrot.safetensors` and keep its type set to `minimax`.
-4. Select `minimax_h3_video_vae_fp16.safetensors` for the video VAE and `minimax_h3_audio_vae_fp32.safetensors` for the audio VAE.
-5. Use `MiniMaxH3ImageToVideo` with `first_frame` and `last_frame` disconnected. Do not add reference conditioning; a negative must not copy the trained concept from a positive.
-6. Ensure the sampled joint latent is decoded through both the video VAE and audio VAE, combined at 24 fps, and written through exactly one `SaveVideo` node. This is required when positive videos have audio.
-7. Queue one short test generation and confirm that a playable video with audio appears in `/workspace/comfy-output`.
-8. Enable ComfyUI's developer-mode options, then choose **Save (API Format)**. A normal UI workflow has a top-level `nodes` list; that format cannot be sent to `/prompt`.
-9. Upload the exported API JSON to `/workspace/workflows/minimax_h3_t2va_api.json` using JupyterLab or `scp`.
-
-For example, run this upload command on your computer:
+The automated setup writes a copy to `$H3_WORKFLOW_API` and changes its four loader filenames to the precise model variants found in the existing ComfyUI. Confirm it is ready:
 
 ```bash
-scp -P RUNPOD_SSH_PORT /local/path/minimax_h3_t2va_api.json root@RUNPOD_IP:/workspace/workflows/minimax_h3_t2va_api.json
+test -s "$H3_WORKFLOW_API" \
+  && jq -e '.["5"].class_type == "MiniMaxH3ImageToVideo" and .["14"].class_type == "SaveVideo"' "$H3_WORKFLOW_API" \
+  && echo "API workflow ready: $H3_WORKFLOW_API"
 ```
 
-Back in the Pod, confirm the workflow exists:
-
-```bash
-test -s "$H3_WORKFLOW_API" && echo "API workflow ready: $H3_WORKFLOW_API"
-```
-
-This manual workflow export is a one-time setup. All per-file prompting, sizing, seeding, queuing, downloading, normalization, validation, and resuming are automatic in the following step.
+No manual ComfyUI export is needed. The generator changes the prompt, width, height, length, seed, and filename prefix for every source file while leaving the tested sampling and AV decode graph intact.
 
 ## 8. Generate the NSYNC negatives automatically
 
@@ -742,7 +729,7 @@ Do not lower the video microbatch below 1.
 
 ### The generator rejects the workflow as UI format
 
-Enable developer-mode options in ComfyUI and export **Save (API Format)**. The official template JSON itself is a UI workflow and cannot be passed directly to `--workflow`.
+Re-source `/workspace/minimax-h3-env.sh` and confirm that `H3_WORKFLOW_API` points to the runtime copy written by the bootstrap. The bundled workflow is already in API format. If you substituted a custom graph, enable developer-mode options in ComfyUI and export **Save (API Format)**; a normal UI workflow cannot be passed directly to `--workflow`.
 
 ### The generator says the positive has audio but the output does not
 

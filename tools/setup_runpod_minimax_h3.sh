@@ -473,6 +473,51 @@ mkdir -p \
     "$WORKSPACE_ROOT/logs" \
     "$WORKSPACE_ROOT/comfy-output"
 
+comfy_model_name() {
+    local category_root="$1"
+    local resolved_model="$2"
+    local candidate
+    while IFS= read -r candidate; do
+        if [[ "$(readlink -f -- "$candidate")" == "$resolved_model" ]]; then
+            printf '%s\n' "${candidate#"$category_root"/}"
+            return 0
+        fi
+    done < <(find -H "$category_root" -maxdepth 3 \( -type f -o -type l \) -name '*.safetensors' -print 2>/dev/null)
+    return 1
+}
+
+H3_COMFY_DIFFUSION_NAME="$(comfy_model_name "$COMFYUI_ROOT/models/diffusion_models" "$H3_DIFFUSION_MODEL" || basename -- "$H3_DIFFUSION_MODEL")"
+H3_COMFY_TEXT_ENCODER_NAME="$(comfy_model_name "$COMFYUI_ROOT/models/text_encoders" "$H3_TEXT_ENCODER" || basename -- "$H3_TEXT_ENCODER")"
+H3_COMFY_VIDEO_VAE_NAME="$(comfy_model_name "$COMFYUI_ROOT/models/vae" "$H3_VIDEO_VAE" || basename -- "$H3_VIDEO_VAE")"
+H3_COMFY_AUDIO_VAE_NAME="$(comfy_model_name "$COMFYUI_ROOT/models/vae" "$H3_AUDIO_VAE" || basename -- "$H3_AUDIO_VAE")"
+
+BUNDLED_H3_WORKFLOW="$DP_ROOT/examples/minimax_h3_t2va_api.json"
+[[ -f "$BUNDLED_H3_WORKFLOW" ]] || die "Bundled MiniMax H3 API workflow is missing: $BUNDLED_H3_WORKFLOW"
+workflow_tmp="$(mktemp "$WORKSPACE_ROOT/workflows/.minimax_h3_t2va_api.json.XXXXXX")"
+python - \
+    "$BUNDLED_H3_WORKFLOW" \
+    "$workflow_tmp" \
+    "$H3_COMFY_DIFFUSION_NAME" \
+    "$H3_COMFY_TEXT_ENCODER_NAME" \
+    "$H3_COMFY_VIDEO_VAE_NAME" \
+    "$H3_COMFY_AUDIO_VAE_NAME" <<'PY'
+import json
+import sys
+
+source, destination, diffusion, text_encoder, video_vae, audio_vae = sys.argv[1:]
+with open(source, encoding="utf-8") as file:
+    workflow = json.load(file)
+workflow["1"]["inputs"]["unet_name"] = diffusion
+workflow["2"]["inputs"]["clip_name"] = text_encoder
+workflow["3"]["inputs"]["vae_name"] = video_vae
+workflow["4"]["inputs"]["vae_name"] = audio_vae
+with open(destination, "w", encoding="utf-8") as file:
+    json.dump(workflow, file, indent=2)
+    file.write("\n")
+PY
+mv -f -- "$workflow_tmp" "$H3_WORKFLOW_API"
+log "Ready-to-queue ComfyUI API workflow: $H3_WORKFLOW_API"
+
 ENV_FILE="$WORKSPACE_ROOT/minimax-h3-env.sh"
 ENV_FILE_TMP="$(mktemp "$WORKSPACE_ROOT/.minimax-h3-env.sh.XXXXXX")"
 {

@@ -1,6 +1,9 @@
+import json
 import os
 from pathlib import Path
+import shlex
 import subprocess
+import sys
 import tempfile
 import textwrap
 import unittest
@@ -43,8 +46,10 @@ class RunPodSetupScriptTest(unittest.TestCase):
                     printf '%s\\n' '3.12.0' '2.9.1+cu130' '13.0' 'true' 'Fake GPU'
                 elif [[ "${1:-}" == "-" && "$#" == 4 ]]; then
                     printf '%s\\n' 'py3_12_0-torch2_9_1-cu13_0'
+                else
+                    exec __REAL_PYTHON__ "$@"
                 fi
-                """,
+                """.replace("__REAL_PYTHON__", shlex.quote(sys.executable)),
             )
             self._write_executable(
                 fake_bin / "git",
@@ -104,6 +109,15 @@ class RunPodSetupScriptTest(unittest.TestCase):
             self.assertIn(f"export H3_DIFFUSION_MODEL={model_paths[0]}", env_contents)
             self.assertIn(f"export DP_VENV={venv}", env_contents)
             self.assertTrue((venv / ".diffusion-pipe-setup-signature").is_file())
+
+            workflow_path = workspace / "workflows" / "minimax_h3_t2va_api.json"
+            with workflow_path.open(encoding="utf-8") as file:
+                workflow = json.load(file)
+            self.assertEqual(workflow["1"]["inputs"]["unet_name"], model_paths[0].name)
+            self.assertEqual(workflow["2"]["inputs"]["clip_name"], model_paths[1].name)
+            self.assertEqual(workflow["3"]["inputs"]["vae_name"], model_paths[2].name)
+            self.assertEqual(workflow["4"]["inputs"]["vae_name"], model_paths[3].name)
+            self.assertIn(f"export H3_WORKFLOW_API={workflow_path}", env_contents)
 
             second_result = subprocess.run(
                 command,
