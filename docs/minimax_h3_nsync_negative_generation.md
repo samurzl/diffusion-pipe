@@ -2,6 +2,8 @@
 
 [`tools/generate_minimax_h3_nsync_negatives.py`](../tools/generate_minimax_h3_nsync_negatives.py) builds the paired generated-negative directory required by MiniMax H3 NSYNC training. ComfyUI runs the local MiniMax H3 model as the inference backend; the script only uses ComfyUI's local HTTP queue, history, and file endpoints.
 
+If you are starting with an empty GPU instance, use the [fresh RunPod MiniMax H3 NSYNC + Self-Flow guide](minimax_h3_nsync_self_flow_runpod.md) for the Pod template, installation, model downloads, ComfyUI setup, negative generation, caching, and training commands in one sequence.
+
 The script never calls the hosted MiniMax service. It rejects workflows containing ComfyUI MiniMax partner/API nodes such as `MinimaxHailuo03TextToVideoNode`.
 
 ## What the script guarantees

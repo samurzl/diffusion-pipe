@@ -1,17 +1,53 @@
 import argparse
 import os
-import wandb
+import sys
+import json
+from pathlib import Path
+
+from utils.config_validation import ConfigValidationError, load_and_validate_config
+
+
+# Run a cheap, dependency-light preflight before importing torch, DeepSpeed,
+# Hugging Face, or ComfyUI. Model and dataset initialization can take many
+# minutes, so discovering a TOML typo after those imports is needlessly costly.
+_preflight_parser = argparse.ArgumentParser(add_help=False)
+_preflight_parser.add_argument('--config')
+_preflight_parser.add_argument('--validate_only', action='store_true')
+_preflight_parser.add_argument('--i_know_what_i_am_doing', action='store_true')
+_preflight_parser.add_argument('--resume_from_checkpoint', nargs='?', const=True, default=None)
+_preflight_args, _ = _preflight_parser.parse_known_args()
+
+_preflight_config = None
+_preflight_dataset_configs = {}
+if _preflight_args.config:
+    try:
+        _preflight_config, _preflight_dataset_configs = load_and_validate_config(
+            _preflight_args.config,
+            skip_dataset_validation=_preflight_args.i_know_what_i_am_doing,
+            world_size=int(os.environ['WORLD_SIZE']) if 'WORLD_SIZE' in os.environ else None,
+            resume_from_checkpoint=_preflight_args.resume_from_checkpoint,
+        )
+    except ConfigValidationError as exc:
+        raise SystemExit(f'\n{exc}') from None
+elif '--help' not in sys.argv and '-h' not in sys.argv:
+    raise SystemExit('--config is required')
+
+if _preflight_args.validate_only:
+    if not _preflight_args.config:
+        raise SystemExit('--validate_only requires --config')
+    print(f'Configuration is valid: {_preflight_args.config}')
+    raise SystemExit(0)
+
+
 from datetime import datetime, timezone
 import shutil
 import glob
 import time
 import random
-import json
 import inspect
-from pathlib import Path
+import importlib
 from collections import defaultdict
 
-import toml
 import deepspeed
 from deepspeed import comm as dist
 from deepspeed.runtime.pipe import module as ds_pipe_module
@@ -54,6 +90,7 @@ parser.add_argument('--i_know_what_i_am_doing', action='store_true', help="Skip 
 parser.add_argument('--master_port', type=int, default=29500, help='Master port for distributed training')
 parser.add_argument('--dump_dataset', type=Path, default=None, help='Decode cached latents and dump the dataset to this directory.')
 parser.add_argument('--test_sample', action='store_true', help='Generate and write an image to example.png and then quit.')
+parser.add_argument('--validate_only', action='store_true', help='Validate config and dataset paths without importing training dependencies, initializing CUDA, or loading models.')
 parser = deepspeed.add_config_arguments(parser)
 args = parser.parse_args()
 
@@ -161,6 +198,37 @@ def set_config_defaults(config):
         raise ValueError('NSYNC requires uncond_fraction=0 so paired positive and negative prompts stay identical')
     if self_flow_config['enabled'] and config['pipeline_stages'] != 1:
         raise ValueError('Self-Flow currently requires pipeline_stages=1 because its EMA teacher branch is forward-only')
+
+
+def validate_optimizer_availability(config):
+    """Catch optimizer typos/missing optional packages before loading any model."""
+    optim_type = config['optimizer']['type']
+    optim_type_lower = optim_type.lower()
+    module_and_attribute = {
+        'adamw8bit': ('bitsandbytes', 'optim.AdamW8bit'),
+        'adamw_optimi': ('optimi', 'AdamW'),
+        'stableadamw': ('optimi', 'StableAdamW'),
+        'offload': ('torchao.prototype.low_bit_optim', 'CPUOffloadOptimizer'),
+        'automagic': ('optimizers.automagic', 'Automagic'),
+        'genericoptim': ('optimizers.generic_optim', 'GenericOptim'),
+        'adamw8bitkahan': ('optimizers.adamw_8bit', 'AdamW8bitKahan'),
+    }
+    if optim_type_lower in ('adamw', 'sgd'):
+        return
+    if optim_type_lower in module_and_attribute:
+        module_name, attribute_path = module_and_attribute[optim_type_lower]
+    else:
+        module_name, attribute_path = 'pytorch_optimizer', optim_type
+
+    try:
+        value = importlib.import_module(module_name)
+        for attribute in attribute_path.split('.'):
+            value = getattr(value, attribute)
+    except (ImportError, AttributeError) as exc:
+        raise ValueError(
+            f'Optimizer {optim_type!r} is unavailable. Check optimizer.type and install its optional dependency. '
+            f'Underlying error: {exc}'
+        ) from None
 
 
 def get_most_recent_run_dir(output_dir):
@@ -299,11 +367,14 @@ if __name__ == '__main__':
     deepspeed.utils.set_log_level_from_string('info')
     apply_patches()
 
-    with open(args.config) as f:
-        # Inline TOML tables are not pickleable, which messes up the multiprocessing dataset stuff. This is a workaround.
-        config = json.loads(json.dumps(toml.load(f)))
+    # Inline TOML tables are not pickleable, which messes up the multiprocessing
+    # dataset code. The JSON round trip also gives this process a private copy of
+    # the already-preflighted config.
+    config = json.loads(json.dumps(_preflight_config))
 
     set_config_defaults(config)
+    if not args.cache_only:
+        validate_optimizer_availability(config)
     common.AUTOCAST_DTYPE = config['model']['dtype']
     dataset_util.UNCOND_FRACTION = config.get('uncond_fraction', 0.0)
     if map_num_proc := config.get('map_num_proc', None):
@@ -410,8 +481,9 @@ if __name__ == '__main__':
     #     pil_image.save('test.jpg')
     # quit()
 
-    with open(config['dataset']) as f:
-        dataset_config = toml.load(f)
+    dataset_config = json.loads(json.dumps(
+        _preflight_dataset_configs[str(Path(config['dataset']).expanduser())]
+    ))
 
     micro_batch_size_per_gpu = config.get('micro_batch_size_per_gpu', 1)
     if isinstance(micro_batch_size_per_gpu, int):
@@ -453,7 +525,8 @@ if __name__ == '__main__':
         'steps_per_print': config.get('steps_per_print', 1),
     }
     caching_batch_size = config.get('caching_batch_size', 1)
-    dataset_manager = dataset_util.DatasetManager(model, regenerate_cache=regenerate_cache, trust_cache=args.trust_cache, caching_batch_size=caching_batch_size, keep_models_loaded=args.test_sample)
+    trust_cache = args.trust_cache or config.get('trust_cache', False)
+    dataset_manager = dataset_util.DatasetManager(model, regenerate_cache=regenerate_cache, trust_cache=trust_cache, caching_batch_size=caching_batch_size, keep_models_loaded=args.test_sample)
 
     train_data = dataset_util.Dataset(dataset_config, model, skip_dataset_validation=args.i_know_what_i_am_doing)
     if nsync_enabled and not train_data.nsync_enabled:
@@ -471,8 +544,9 @@ if __name__ == '__main__':
         else:
             name = eval_dataset['name']
             config_path = eval_dataset['config']
-        with open(config_path) as f:
-            eval_dataset_config = toml.load(f)
+        eval_dataset_config = json.loads(json.dumps(
+            _preflight_dataset_configs[str(Path(config_path).expanduser())]
+        ))
         eval_data_map[name] = dataset_util.Dataset(eval_dataset_config, model, skip_dataset_validation=args.i_know_what_i_am_doing)
         dataset_manager.register(eval_data_map[name])
 
@@ -586,12 +660,14 @@ if __name__ == '__main__':
         shutil.copy(args.config, run_dir)
         shutil.copy(config['dataset'], run_dir)
         for eval_dataset in config['eval_datasets']:
-            shutil.copy(eval_dataset['config'], run_dir)
+            eval_config_path = eval_dataset if isinstance(eval_dataset, str) else eval_dataset['config']
+            shutil.copy(eval_config_path, run_dir)
     dist.barrier()
 
     # WandB logging
     wandb_enable = config.get('monitoring', {}).get('enable_wandb', False)
     if wandb_enable and is_main_process():
+        import wandb
         wandb_api_key     = config['monitoring']['wandb_api_key']
         wandb_tracker     = config['monitoring']['wandb_tracker_name']
         wandb_run_name    = config['monitoring']['wandb_run_name']

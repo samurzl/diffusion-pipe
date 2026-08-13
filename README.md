@@ -112,6 +112,8 @@ For images, any image format that can be loaded by Pillow should work. For video
 
 MiniMax H3 NSYNC training needs a generated negative for every positive image or video. [`tools/generate_minimax_h3_nsync_negatives.py`](./tools/generate_minimax_h3_nsync_negatives.py) automates this using a **locally running MiniMax H3 ComfyUI workflow**. It does not use the hosted MiniMax API and rejects ComfyUI partner/API MiniMax nodes.
 
+For an end-to-end setup starting from an empty GPU instance, follow the [fresh RunPod MiniMax H3 NSYNC + Self-Flow guide](./docs/minimax_h3_nsync_self_flow_runpod.md). It specifies the Pod template and storage, installs both diffusion-pipe and its pinned ComfyUI, downloads and shares the model files, generates the negative dataset, fills in the paired configs, pre-caches the dataset, and launches resumable training command by command.
+
 The utility reads positive `.txt` captions or `captions.json`, removes the target trigger/style text from the generation prompt, queues the local H3 workflow, and writes same-stem negative media. It also normalizes dimensions, frame count/duration, media type, and audio presence so the files pair correctly during NSYNC training.
 
 Start with a dry run:
@@ -138,6 +140,12 @@ Once you've familiarized yourself with the config file format, go ahead and make
 Launch training like this:
 ```
 NCCL_P2P_DISABLE="1" NCCL_IB_DISABLE="1" deepspeed --num_gpus=1 train.py --deepspeed --config examples/hunyuan_video.toml
+```
+
+`train.py` performs a lightweight configuration preflight before importing PyTorch, starting CUDA/DeepSpeed, scanning datasets, or loading models. It reports all of the inexpensive-to-detect configuration and path errors together. You can also run only that check while editing a configuration; it normally completes in a fraction of a second and does not require a GPU:
+
+```bash
+python train.py --validate_only --config path/to/config.toml
 ```
 RTX 4000 series needs those 2 environment variables set. Other GPUs may not need them. You can try without them, Deepspeed will complain if it's wrong.
 
@@ -174,7 +182,7 @@ Latents and text embeddings are cached to disk before training happens. This way
 
 This caching also means that training LoRAs for text encoders is not currently supported.
 
-Three flags are relevant for caching. ```--cache_only``` does the caching flow, then exits without training anything. ```--regenerate_cache``` forces cache regeneration. ```--trust_cache``` will blindly load the cached metadata files, without checking if any data files have changed via the fingerprint. This can speed up loading for very large datasets (100,000+ images), but you must make sure nothing in the dataset has changed.
+Three flags are relevant for caching. ```--cache_only``` does the caching flow, then exits without training anything. ```--regenerate_cache``` forces cache regeneration. ```--trust_cache``` will blindly load the cached metadata files, without checking if any data files have changed via the fingerprint. This can speed up loading for very large datasets (100,000+ images), but you must make sure nothing in the dataset has changed. If the training data remains fixed across launches, you can persist the same behavior by setting `trust_cache = true` in the main training TOML instead of passing the flag every time.
 
 ## Extra
 You can check out my [qlora-pipe](https://github.com/tdrussell/qlora-pipe) project, which is basically the same thing as this but for LLMs.

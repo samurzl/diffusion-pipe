@@ -96,6 +96,10 @@ caching_batch_size = 1
 # especially for video data.
 #map_num_proc = 32
 
+# Skip checking whether dataset files/config changed and directly reuse existing metadata caches.
+# This can make startup much faster for very large datasets, but only enable it while the training data stays unchanged.
+#trust_cache = true
+
 # Use torch.compile on the model. Can speed up training throughput by a decent amount. Not tested on all models.
 #compile = true
 
