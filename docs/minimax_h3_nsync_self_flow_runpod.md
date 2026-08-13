@@ -67,6 +67,69 @@ Check the persistent mount:
 df -h /workspace
 ```
 
+## Automated installation on an existing ComfyUI volume
+
+If the Network Volume already contains ComfyUI and the H3 models, use [`tools/setup_runpod_minimax_h3.sh`](../tools/setup_runpod_minimax_h3.sh). The script:
+
+- finds an existing ComfyUI under `/workspace`, or accepts its path through `--comfy-root`;
+- uses the H3 checkpoints directly from that installation's `models` folders;
+- does **not** download, copy, symlink, upgrade, or otherwise modify ComfyUI or its models;
+- creates a version-specific diffusion-pipe venv on the Network Volume;
+- skips `pip` on later Pods when that venv is current and passes its import/CUDA check;
+- installs only missing container-level tools on each new Pod;
+- initializes diffusion-pipe's pinned ComfyUI **code submodule**, which its trainer imports independently of the existing ComfyUI application; and
+- writes `/workspace/minimax-h3-env.sh` with the discovered model paths and environment activation.
+
+On the first Pod attached to the volume, install Git and clone diffusion-pipe if it is not already present:
+
+```bash
+apt-get update
+DEBIAN_FRONTEND=noninteractive apt-get install -y git
+```
+
+```bash
+if [[ ! -d /workspace/diffusion-pipe/.git ]]; then
+  git clone --recurse-submodules https://github.com/samurzl/diffusion-pipe.git /workspace/diffusion-pipe
+fi
+```
+
+Run the bootstrap. Replace `/workspace/ComfyUI` if your existing installation is elsewhere; omit `--comfy-root` to let the script search common `/workspace` locations:
+
+```bash
+bash /workspace/diffusion-pipe/tools/setup_runpod_minimax_h3.sh \
+  --comfy-root /workspace/ComfyUI
+```
+
+Activate the generated environment in the current shell:
+
+```bash
+source /workspace/minimax-h3-env.sh
+```
+
+Confirm which existing files it selected:
+
+```bash
+printf 'ComfyUI: %s\nDiffusion model: %s\nText encoder: %s\nVideo VAE: %s\nAudio VAE: %s\nTraining venv: %s\n' \
+  "$COMFYUI_ROOT" "$H3_DIFFUSION_MODEL" "$H3_TEXT_ENCODER" \
+  "$H3_VIDEO_VAE" "$H3_AUDIO_VAE" "$DP_VENV"
+```
+
+On every later Pod using the **same Network Volume and the same PyTorch template**, the fast path is just:
+
+```bash
+bash /workspace/diffusion-pipe/tools/setup_runpod_minimax_h3.sh \
+  --comfy-root /workspace/ComfyUI
+source /workspace/minimax-h3-env.sh
+```
+
+The script supports alternate model paths, a nonstandard ComfyUI Python, forced dependency refreshes, and a recoverable venv rebuild. See every option with:
+
+```bash
+bash /workspace/diffusion-pipe/tools/setup_runpod_minimax_h3.sh --help
+```
+
+After the automated setup succeeds, skip the manual installation and model-download steps 3 through 5 and continue at step 6. The manual steps remain below for volumes that do not already contain ComfyUI and the H3 weights.
+
 ## 3. Install system tools and clone diffusion-pipe
 
 ```bash
@@ -101,7 +164,13 @@ Define the paths used in the rest of the guide. Re-run this block after opening 
 ```bash
 export DP_ROOT=/workspace/diffusion-pipe
 export DP_VENV=/workspace/venvs/diffusion-pipe
+export COMFYUI_ROOT="$DP_ROOT/submodules/ComfyUI"
+export COMFYUI_PYTHON="$DP_VENV/bin/python"
 export H3_MODEL_ROOT=/workspace/models/minimax-h3
+export H3_DIFFUSION_MODEL="$H3_MODEL_ROOT/diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors"
+export H3_TEXT_ENCODER="$H3_MODEL_ROOT/text_encoders/qwen3vl_32b_minimax_h3_int8_convrot.safetensors"
+export H3_VIDEO_VAE="$H3_MODEL_ROOT/vae/minimax_h3_video_vae_fp16.safetensors"
+export H3_AUDIO_VAE="$H3_MODEL_ROOT/vae/minimax_h3_audio_vae_fp32.safetensors"
 export H3_DATA_ROOT=/workspace/data/minimax-h3
 export H3_CONFIG_ROOT=/workspace/configs/minimax-h3
 export H3_OUTPUT_ROOT=/workspace/output/minimax-h3-nsync-self-flow
@@ -283,9 +352,15 @@ mkdir -p /workspace/workflows /workspace/comfy-output /workspace/logs
 Start ComfyUI in a detached `tmux` session:
 
 ```bash
-tmux new-session -d -s comfy \
-  "$DP_VENV/bin/python $DP_ROOT/submodules/ComfyUI/main.py --listen 0.0.0.0 --port 8188 --output-directory /workspace/comfy-output 2>&1 | tee /workspace/logs/comfy.log"
+if curl --fail --max-time 2 http://127.0.0.1:8188/system_stats >/dev/null 2>&1; then
+  echo 'The existing ComfyUI server is already running.'
+else
+  tmux new-session -d -s comfy \
+    "$COMFYUI_PYTHON $COMFYUI_ROOT/main.py --listen 0.0.0.0 --port 8188 --output-directory /workspace/comfy-output 2>&1 | tee /workspace/logs/comfy.log"
+fi
 ```
+
+The automated setup prefers the existing ComfyUI `.venv` or `venv` for `COMFYUI_PYTHON`. If your installation has a custom launcher or another environment, start it normally or rerun setup with `--comfy-python /path/to/python`.
 
 Watch startup:
 
@@ -411,13 +486,20 @@ For detailed media guarantees and error messages, see [Generating MiniMax H3 NSY
 After every negative exists, stop the local ComfyUI process before caching or training:
 
 ```bash
-tmux kill-session -t comfy
+if tmux has-session -t comfy 2>/dev/null; then
+  tmux kill-session -t comfy
+fi
 ```
 
-Confirm that the process exited:
+If ComfyUI was already running before this guide, stop it with that installation's normal launcher or service command. Then confirm that its API is no longer reachable; this block deliberately fails while ComfyUI is still using the GPU:
 
 ```bash
-curl --max-time 2 http://127.0.0.1:8188/system_stats || echo 'ComfyUI is stopped'
+if curl --fail --max-time 2 http://127.0.0.1:8188/system_stats >/dev/null 2>&1; then
+  echo 'ComfyUI is still running. Stop it before training.' >&2
+  false
+else
+  echo 'ComfyUI is stopped.'
+fi
 ```
 
 ```bash
@@ -442,10 +524,10 @@ Fill in the training paths:
 sed -i \
   -e "s|output_dir = 'path_to_output_dir'|output_dir = '$H3_OUTPUT_ROOT'|" \
   -e "s|dataset = 'examples/minimax_h3_nsync_self_flow_dataset.toml'|dataset = '$H3_CONFIG_ROOT/dataset.toml'|" \
-  -e "s|/path/to/minimax_h3_fl2va_pruned_int8_convrot.safetensors|$H3_MODEL_ROOT/diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors|" \
-  -e "s|/path/to/minimax_h3_video_vae_fp16.safetensors|$H3_MODEL_ROOT/vae/minimax_h3_video_vae_fp16.safetensors|" \
-  -e "s|/path/to/minimax_h3_audio_vae_fp32.safetensors|$H3_MODEL_ROOT/vae/minimax_h3_audio_vae_fp32.safetensors|" \
-  -e "s|/path/to/qwen3vl_32b_minimax_h3_int8_convrot.safetensors|$H3_MODEL_ROOT/text_encoders/qwen3vl_32b_minimax_h3_int8_convrot.safetensors|" \
+  -e "s|/path/to/minimax_h3_fl2va_pruned_int8_convrot.safetensors|$H3_DIFFUSION_MODEL|" \
+  -e "s|/path/to/minimax_h3_video_vae_fp16.safetensors|$H3_VIDEO_VAE|" \
+  -e "s|/path/to/minimax_h3_audio_vae_fp32.safetensors|$H3_AUDIO_VAE|" \
+  -e "s|/path/to/qwen3vl_32b_minimax_h3_int8_convrot.safetensors|$H3_TEXT_ENCODER|" \
   "$H3_CONFIG_ROOT/train.toml"
 ```
 
@@ -612,7 +694,15 @@ The selected template/image is not the one in this guide. Recreate the Pod with 
 
 ### ComfyUI does not list the H3 nodes
 
-Confirm that the pinned submodule is initialized:
+When using an existing ComfyUI installation, confirm that it contains the local H3 nodes:
+
+```bash
+test -f "$COMFYUI_ROOT/comfy_extras/nodes_minimax_h3.py" \
+  && echo 'MiniMax H3 nodes are present' \
+  || echo 'Update this ComfyUI installation using its normal update method'
+```
+
+The separate pinned submodule used by diffusion-pipe can be initialized with:
 
 ```bash
 cd "$DP_ROOT"
@@ -624,10 +714,14 @@ Restart ComfyUI and inspect `/workspace/logs/comfy.log`.
 
 ### ComfyUI does not list the model files
 
-Check the links and their targets:
+Check the model paths discovered by the setup:
 
 ```bash
-find "$DP_ROOT/submodules/ComfyUI/models" -maxdepth 2 -type l -exec ls -l {} \;
+printf '%s\n' "$H3_DIFFUSION_MODEL" "$H3_TEXT_ENCODER" "$H3_VIDEO_VAE" "$H3_AUDIO_VAE"
+test -f "$H3_DIFFUSION_MODEL" \
+  && test -f "$H3_TEXT_ENCODER" \
+  && test -f "$H3_VIDEO_VAE" \
+  && test -f "$H3_AUDIO_VAE"
 ```
 
 Restart ComfyUI after adding or changing model files.

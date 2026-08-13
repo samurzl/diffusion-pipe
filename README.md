@@ -112,7 +112,7 @@ For images, any image format that can be loaded by Pillow should work. For video
 
 MiniMax H3 NSYNC training needs a generated negative for every positive image or video. [`tools/generate_minimax_h3_nsync_negatives.py`](./tools/generate_minimax_h3_nsync_negatives.py) automates this using a **locally running MiniMax H3 ComfyUI workflow**. It does not use the hosted MiniMax API and rejects ComfyUI partner/API MiniMax nodes.
 
-For an end-to-end setup starting from an empty GPU instance, follow the [fresh RunPod MiniMax H3 NSYNC + Self-Flow guide](./docs/minimax_h3_nsync_self_flow_runpod.md). It specifies the Pod template and storage, installs both diffusion-pipe and its pinned ComfyUI, downloads and shares the model files, generates the negative dataset, fills in the paired configs, pre-caches the dataset, and launches resumable training command by command.
+For an end-to-end setup starting from an empty GPU instance, follow the [fresh RunPod MiniMax H3 NSYNC + Self-Flow guide](./docs/minimax_h3_nsync_self_flow_runpod.md). It specifies the Pod template and storage, provides an [idempotent bootstrap script](./tools/setup_runpod_minimax_h3.sh) that reuses an existing persistent ComfyUI and its model files, documents the manual alternative, generates the negative dataset, fills in the paired configs, pre-caches the dataset, and launches resumable training command by command.
 
 The utility reads positive `.txt` captions or `captions.json`, removes the target trigger/style text from the generation prompt, queues the local H3 workflow, and writes same-stem negative media. It also normalizes dimensions, frame count/duration, media type, and audio presence so the files pair correctly during NSYNC training.
 
