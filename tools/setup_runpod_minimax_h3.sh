@@ -22,6 +22,7 @@ DIFFUSION_MODEL_ARG=""
 TEXT_ENCODER_ARG=""
 VIDEO_VAE_ARG=""
 AUDIO_VAE_ARG=""
+TURBO_LORA_ARG=""
 SKIP_SYSTEM_PACKAGES=0
 ALLOW_TEMPLATE_MISMATCH=0
 ALLOW_NONPERSISTENT_WORKSPACE=0
@@ -46,7 +47,8 @@ usage() {
 Usage: tools/setup_runpod_minimax_h3.sh [options]
 
 Build or reuse a persistent diffusion-pipe Python environment on a RunPod Pod,
-and discover MiniMax H3 model files in an existing ComfyUI installation.
+and discover MiniMax H3 model files plus the LightX2V Turbo LoRA in an existing
+ComfyUI installation.
 
 Options:
   --comfy-root PATH              Existing ComfyUI directory containing main.py
@@ -58,6 +60,8 @@ Options:
   --text-encoder PATH            Override the discovered H3 text encoder.
   --video-vae PATH               Override the discovered H3 video VAE.
   --audio-vae PATH               Override the discovered H3 audio VAE.
+  --turbo-lora PATH              Override the discovered LightX2V MiniMax H3
+                                 Turbo 4-step ComfyUI LoRA.
   --workspace PATH               Persistent mount root (default: /workspace).
   --skip-system-packages         Do not install missing apt packages.
   --force-python-install         Re-run pip even when the cached environment
@@ -71,8 +75,9 @@ Options:
                                  container filesystem. Intended for testing only.
   -h, --help                     Show this help.
 
-The script writes /workspace/minimax-h3-env.sh (under the selected workspace).
-Source that file after setup and in every new shell.
+The script writes /workspace/workflows/minimax_h3_t2va_api.json and
+/workspace/minimax-h3-env.sh (under the selected workspace). Source the
+environment file after setup and in every new shell.
 EOF
 }
 
@@ -112,6 +117,11 @@ while (($#)); do
         --audio-vae)
             require_option_value "$1" "${2:-}"
             AUDIO_VAE_ARG="$2"
+            shift 2
+            ;;
+        --turbo-lora)
+            require_option_value "$1" "${2:-}"
+            TURBO_LORA_ARG="$2"
             shift 2
             ;;
         --workspace)
@@ -358,10 +368,15 @@ H3_VIDEO_VAE="$(resolve_override "Video VAE" "$VIDEO_VAE_ARG" || find_first_mode
 H3_AUDIO_VAE="$(resolve_override "Audio VAE" "$AUDIO_VAE_ARG" || find_first_model \
     "$COMFYUI_ROOT/models/vae" minimax_h3_audio_vae_fp32.safetensors)" || die "MiniMax H3 audio VAE was not found"
 
+H3_TURBO_LORA="$(resolve_override "LightX2V Turbo LoRA" "$TURBO_LORA_ARG" || find_first_model \
+    "$COMFYUI_ROOT/models/loras" \
+    minimax_h3_fl2v_turbo_4step_v1.0_768p_comfyui_bf16.safetensors)" || die "The LightX2V MiniMax H3 Turbo 4-step ComfyUI LoRA was not found under $COMFYUI_ROOT/models/loras. Download minimax_h3_fl2v_turbo_4step_v1.0_768p_comfyui_bf16.safetensors from lightx2v/Minimax-h3-Turbo, or pass --turbo-lora PATH."
+
 log "Diffusion model: $H3_DIFFUSION_MODEL"
 log "Text encoder:   $H3_TEXT_ENCODER"
 log "Video VAE:      $H3_VIDEO_VAE"
 log "Audio VAE:      $H3_AUDIO_VAE"
+log "Turbo LoRA:     $H3_TURBO_LORA"
 
 if [[ -n "$COMFYUI_PYTHON_ARG" ]]; then
     [[ -x "$COMFYUI_PYTHON_ARG" ]] || die "ComfyUI Python is not executable: $COMFYUI_PYTHON_ARG"
@@ -490,6 +505,7 @@ H3_COMFY_DIFFUSION_NAME="$(comfy_model_name "$COMFYUI_ROOT/models/diffusion_mode
 H3_COMFY_TEXT_ENCODER_NAME="$(comfy_model_name "$COMFYUI_ROOT/models/text_encoders" "$H3_TEXT_ENCODER" || basename -- "$H3_TEXT_ENCODER")"
 H3_COMFY_VIDEO_VAE_NAME="$(comfy_model_name "$COMFYUI_ROOT/models/vae" "$H3_VIDEO_VAE" || basename -- "$H3_VIDEO_VAE")"
 H3_COMFY_AUDIO_VAE_NAME="$(comfy_model_name "$COMFYUI_ROOT/models/vae" "$H3_AUDIO_VAE" || basename -- "$H3_AUDIO_VAE")"
+H3_COMFY_TURBO_LORA_NAME="$(comfy_model_name "$COMFYUI_ROOT/models/loras" "$H3_TURBO_LORA" || basename -- "$H3_TURBO_LORA")"
 
 BUNDLED_H3_WORKFLOW="$DP_ROOT/examples/minimax_h3_t2va_api.json"
 [[ -f "$BUNDLED_H3_WORKFLOW" ]] || die "Bundled MiniMax H3 API workflow is missing: $BUNDLED_H3_WORKFLOW"
@@ -500,17 +516,19 @@ python - \
     "$H3_COMFY_DIFFUSION_NAME" \
     "$H3_COMFY_TEXT_ENCODER_NAME" \
     "$H3_COMFY_VIDEO_VAE_NAME" \
-    "$H3_COMFY_AUDIO_VAE_NAME" <<'PY'
+    "$H3_COMFY_AUDIO_VAE_NAME" \
+    "$H3_COMFY_TURBO_LORA_NAME" <<'PY'
 import json
 import sys
 
-source, destination, diffusion, text_encoder, video_vae, audio_vae = sys.argv[1:]
+source, destination, diffusion, text_encoder, video_vae, audio_vae, turbo_lora = sys.argv[1:]
 with open(source, encoding="utf-8") as file:
     workflow = json.load(file)
 workflow["1"]["inputs"]["unet_name"] = diffusion
 workflow["2"]["inputs"]["clip_name"] = text_encoder
 workflow["3"]["inputs"]["vae_name"] = video_vae
 workflow["4"]["inputs"]["vae_name"] = audio_vae
+workflow["15"]["inputs"]["lora_name"] = turbo_lora
 with open(destination, "w", encoding="utf-8") as file:
     json.dump(workflow, file, indent=2)
     file.write("\n")
@@ -532,6 +550,7 @@ ENV_FILE_TMP="$(mktemp "$WORKSPACE_ROOT/.minimax-h3-env.sh.XXXXXX")"
     printf 'export H3_TEXT_ENCODER=%q\n' "$H3_TEXT_ENCODER"
     printf 'export H3_VIDEO_VAE=%q\n' "$H3_VIDEO_VAE"
     printf 'export H3_AUDIO_VAE=%q\n' "$H3_AUDIO_VAE"
+    printf 'export H3_TURBO_LORA=%q\n' "$H3_TURBO_LORA"
     printf 'export H3_DATA_ROOT=%q\n' "$H3_DATA_ROOT"
     printf 'export H3_CONFIG_ROOT=%q\n' "$H3_CONFIG_ROOT"
     printf 'export H3_OUTPUT_ROOT=%q\n' "$H3_OUTPUT_ROOT"

@@ -1,6 +1,6 @@
 # Generating MiniMax H3 NSYNC negatives with local ComfyUI
 
-[`tools/generate_minimax_h3_nsync_negatives.py`](../tools/generate_minimax_h3_nsync_negatives.py) builds the paired generated-negative directory required by MiniMax H3 NSYNC training. ComfyUI runs the local MiniMax H3 model as the inference backend; the script only uses ComfyUI's local HTTP queue, history, and file endpoints. A ready API-format graph is included at [`examples/minimax_h3_t2va_api.json`](../examples/minimax_h3_t2va_api.json); the RunPod bootstrap patches its loader filenames to the model variants it finds in the existing ComfyUI.
+[`tools/generate_minimax_h3_nsync_negatives.py`](../tools/generate_minimax_h3_nsync_negatives.py) builds the paired generated-negative directory required by MiniMax H3 NSYNC training. ComfyUI runs the local MiniMax H3 model as the inference backend; the script only uses ComfyUI's local HTTP queue, history, and file endpoints. A ready API-format graph is included at [`examples/minimax_h3_t2va_api.json`](../examples/minimax_h3_t2va_api.json); it uses the LightX2V four-step Turbo LoRA, and the RunPod bootstrap patches its loader filenames to the model variants it finds in the existing ComfyUI.
 
 If you are starting with an empty GPU instance, use the [fresh RunPod MiniMax H3 NSYNC + Self-Flow guide](minimax_h3_nsync_self_flow_runpod.md) for the Pod template, installation, model downloads, ComfyUI setup, negative generation, caching, and training commands in one sequence.
 
@@ -31,6 +31,7 @@ The script does not copy rewritten prompts into the negative directory as captio
 
 - A locally running ComfyUI instance with local MiniMax H3 inference working.
 - The bundled H3 API workflow, or another H3 text-to-video workflow exported in ComfyUI **API format**.
+- LightX2V's `minimax_h3_fl2v_turbo_4step_v1.0_768p_comfyui_bf16.safetensors` in ComfyUI's `models/loras` directory.
 - `ffmpeg` and `ffprobe` available on `PATH` or supplied through `--ffmpeg` and `--ffprobe`.
 - Positive media with same-stem `.txt` captions, or a standard `captions.json`.
 - Different positive and negative directories.
@@ -50,7 +51,7 @@ For the standard setup, use the bundled workflow directly:
 export H3_WORKFLOW_API=/workspace/workflows/minimax_h3_t2va_api.json
 ```
 
-The RunPod setup script creates that runtime copy with the correct ComfyUI loader filenames. If using the standard model filenames without the bootstrap, use `examples/minimax_h3_t2va_api.json` directly. Continue to [Prepare the positive directory](#prepare-the-positive-directory) unless you need to customize sampling.
+The RunPod setup script creates that runtime copy with the correct ComfyUI loader filenames. If using the standard model filenames without the bootstrap, use `examples/minimax_h3_t2va_api.json` directly. The bundled defaults are 736×416 (approximately 0.3 MP), 56 frames on H3's `17n+5` grid (approximately 2.33 seconds at 24 fps), Euler, six sampling steps, LoRA strength 1.0, and LightX2V's required video/audio sigma shifts of 6/3. The generator replaces the canvas and frame request per positive so paired negatives still match their sources. Continue to [Prepare the positive directory](#prepare-the-positive-directory) unless you need to customize sampling.
 
 To build a custom workflow, create and successfully run the generation graph once in ComfyUI before exporting it:
 

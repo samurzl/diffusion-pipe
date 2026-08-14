@@ -33,7 +33,7 @@ The CUDA 13.0 image is intentional: the [Comfy-Org H3 model card](https://huggin
 
 Attach a **Network Volume** if the models, data, cache, and checkpoints must survive deleting the Pod. A normal Volume Disk also mounts at `/workspace` and survives stops/restarts, but it is deleted with the Pod. See [RunPod's storage comparison](https://docs.runpod.io/pods/storage/types).
 
-The four model files in this guide occupy about 50 GiB before dataset caches or outputs. The storage recommendation assumes a small LoRA dataset; add enough capacity for the positive media, an equally sized negative set, caches, checkpoints, and saved LoRAs. Do not store anything important outside `/workspace`.
+The four base model files plus the LightX2V Turbo LoRA in this guide occupy about 52 GiB before dataset caches or outputs. The storage recommendation assumes a small LoRA dataset; add enough capacity for the positive media, an equally sized negative set, caches, checkpoints, and saved LoRAs. Do not store anything important outside `/workspace`.
 
 If the gallery does not expose the exact image, create a private custom template using the image name above. If CUDA 13.0 is unavailable in the selected region, use `runpod/pytorch:1.0.7-cu1281-torch291-ubuntu2404`; INT8 ConvRot can be less efficient there, so the CUDA 13.0 image remains the preferred setup.
 
@@ -72,25 +72,39 @@ df -h /workspace
 If the Network Volume already contains ComfyUI and the H3 models, use [`tools/setup_runpod_minimax_h3.sh`](../tools/setup_runpod_minimax_h3.sh). The script:
 
 - finds an existing ComfyUI under `/workspace`, or accepts its path through `--comfy-root`;
-- uses the H3 checkpoints directly from that installation's `models` folders;
+- uses the H3 checkpoints and LightX2V Turbo LoRA directly from that installation's `models` folders;
 - does **not** download, copy, symlink, upgrade, or otherwise modify ComfyUI or its models;
 - creates a version-specific diffusion-pipe venv on the Network Volume;
 - skips `pip` on later Pods when that venv is current and passes its import/CUDA check;
 - installs only missing container-level tools on each new Pod;
 - initializes diffusion-pipe's pinned ComfyUI **code submodule**, which its trainer imports independently of the existing ComfyUI application; and
-- writes a ready-to-queue workflow at `/workspace/workflows/minimax_h3_t2va_api.json`, patched to the model variants it discovered; and
+- writes a ready-to-queue workflow at `/workspace/workflows/minimax_h3_t2va_api.json`, patched to the five model filenames it discovered; and
 - writes `/workspace/minimax-h3-env.sh` with the workflow path, discovered model paths, and environment activation.
 
 On the first Pod attached to the volume, install Git and clone diffusion-pipe if it is not already present:
 
 ```bash
 apt-get update
-DEBIAN_FRONTEND=noninteractive apt-get install -y git
+DEBIAN_FRONTEND=noninteractive apt-get install -y git curl
 ```
 
 ```bash
 if [[ ! -d /workspace/diffusion-pipe/.git ]]; then
   git clone --recurse-submodules https://github.com/samurzl/diffusion-pipe.git /workspace/diffusion-pipe
+fi
+```
+
+The ready workflow requires LightX2V's current four-step v1.0 ComfyUI LoRA. If it is not already in the existing installation, download it once to that installation's `models/loras` folder. Replace `/workspace/ComfyUI` here and in the bootstrap command when your installation lives elsewhere:
+
+```bash
+mkdir -p /workspace/ComfyUI/models/loras
+if [[ ! -s /workspace/ComfyUI/models/loras/minimax_h3_fl2v_turbo_4step_v1.0_768p_comfyui_bf16.safetensors ]]; then
+  curl --fail --location --retry 5 --continue-at - \
+    --output /workspace/ComfyUI/models/loras/.minimax_h3_fl2v_turbo_4step_v1.0_768p_comfyui_bf16.safetensors.partial \
+    https://huggingface.co/lightx2v/Minimax-h3-Turbo/resolve/main/minimax_h3_fl2v_turbo_4step_v1.0_768p_comfyui_bf16.safetensors \
+  && mv \
+    /workspace/ComfyUI/models/loras/.minimax_h3_fl2v_turbo_4step_v1.0_768p_comfyui_bf16.safetensors.partial \
+    /workspace/ComfyUI/models/loras/minimax_h3_fl2v_turbo_4step_v1.0_768p_comfyui_bf16.safetensors
 fi
 ```
 
@@ -110,9 +124,9 @@ source /workspace/minimax-h3-env.sh
 Confirm which existing files it selected:
 
 ```bash
-printf 'ComfyUI: %s\nDiffusion model: %s\nText encoder: %s\nVideo VAE: %s\nAudio VAE: %s\nTraining venv: %s\n' \
+printf 'ComfyUI: %s\nDiffusion model: %s\nText encoder: %s\nVideo VAE: %s\nAudio VAE: %s\nTurbo LoRA: %s\nTraining venv: %s\n' \
   "$COMFYUI_ROOT" "$H3_DIFFUSION_MODEL" "$H3_TEXT_ENCODER" \
-  "$H3_VIDEO_VAE" "$H3_AUDIO_VAE" "$DP_VENV"
+  "$H3_VIDEO_VAE" "$H3_AUDIO_VAE" "$H3_TURBO_LORA" "$DP_VENV"
 ```
 
 On every later Pod using the **same Network Volume and the same PyTorch template**, the fast path is just:
@@ -172,6 +186,7 @@ export H3_DIFFUSION_MODEL="$H3_MODEL_ROOT/diffusion_models/minimax_h3_fl2va_prun
 export H3_TEXT_ENCODER="$H3_MODEL_ROOT/text_encoders/qwen3vl_32b_minimax_h3_int8_convrot.safetensors"
 export H3_VIDEO_VAE="$H3_MODEL_ROOT/vae/minimax_h3_video_vae_fp16.safetensors"
 export H3_AUDIO_VAE="$H3_MODEL_ROOT/vae/minimax_h3_audio_vae_fp32.safetensors"
+export H3_TURBO_LORA="$H3_MODEL_ROOT/loras/minimax_h3_fl2v_turbo_4step_v1.0_768p_comfyui_bf16.safetensors"
 export H3_DATA_ROOT=/workspace/data/minimax-h3
 export H3_CONFIG_ROOT=/workspace/configs/minimax-h3
 export H3_OUTPUT_ROOT=/workspace/output/minimax-h3-nsync-self-flow
@@ -253,6 +268,14 @@ hf download Comfy-Org/MiniMax-H3 \
 
 Interrupted `hf download` commands are resumable; run the same command again.
 
+Download LightX2V's four-step v1.0 ComfyUI LoRA:
+
+```bash
+hf download lightx2v/Minimax-h3-Turbo \
+  minimax_h3_fl2v_turbo_4step_v1.0_768p_comfyui_bf16.safetensors \
+  --local-dir "$H3_MODEL_ROOT/loras"
+```
+
 Confirm the files:
 
 ```bash
@@ -269,7 +292,8 @@ Make the same files visible to ComfyUI without duplicating them:
 mkdir -p \
   "$DP_ROOT/submodules/ComfyUI/models/diffusion_models" \
   "$DP_ROOT/submodules/ComfyUI/models/text_encoders" \
-  "$DP_ROOT/submodules/ComfyUI/models/vae"
+  "$DP_ROOT/submodules/ComfyUI/models/vae" \
+  "$DP_ROOT/submodules/ComfyUI/models/loras"
 ```
 
 ```bash
@@ -294,6 +318,12 @@ ln -sfn \
 ln -sfn \
   "$H3_MODEL_ROOT/vae/minimax_h3_audio_vae_fp32.safetensors" \
   "$DP_ROOT/submodules/ComfyUI/models/vae/minimax_h3_audio_vae_fp32.safetensors"
+```
+
+```bash
+ln -sfn \
+  "$H3_TURBO_LORA" \
+  "$DP_ROOT/submodules/ComfyUI/models/loras/minimax_h3_fl2v_turbo_4step_v1.0_768p_comfyui_bf16.safetensors"
 ```
 
 Verify the links:
@@ -379,13 +409,13 @@ In RunPod, open **Connect > HTTP Service [Port 8188]**.
 
 ### Use the ready API workflow
 
-The repository includes [`examples/minimax_h3_t2va_api.json`](../examples/minimax_h3_t2va_api.json). It is already in ComfyUI API format and contains local text-only H3 conditioning, the official sampler/schedule, video and audio decoding, 24 fps muxing, and exactly one `SaveVideo` output. It has no first-frame, last-frame, reference, or hosted MiniMax API connections.
+The repository includes [`examples/minimax_h3_t2va_api.json`](../examples/minimax_h3_t2va_api.json). It is already in ComfyUI API format and contains local text-only H3 conditioning, LightX2V's four-step v1.0 Turbo LoRA at strength 1.0, its required 6/3 video/audio sigma shift, Euler with six sampling steps, video and audio decoding, 24 fps muxing, and exactly one `SaveVideo` output. Its defaults are 736×416 (approximately 0.3 MP) and 56 frames (approximately 2.33 seconds, because H3 snaps a two-second request upward to its `17n+5` frame grid). It has no first-frame, last-frame, reference, or hosted MiniMax API connections.
 
-The automated setup writes a copy to `$H3_WORKFLOW_API` and changes its four loader filenames to the precise model variants found in the existing ComfyUI. Confirm it is ready:
+The automated setup writes a copy to `$H3_WORKFLOW_API` and changes its five loader filenames to the precise model variants found in the existing ComfyUI. Confirm it is ready:
 
 ```bash
 test -s "$H3_WORKFLOW_API" \
-  && jq -e '.["5"].class_type == "MiniMaxH3ImageToVideo" and .["14"].class_type == "SaveVideo"' "$H3_WORKFLOW_API" \
+  && jq -e '.["5"].class_type == "MiniMaxH3ImageToVideo" and .["9"].inputs.steps == 6 and .["15"].class_type == "LoraLoaderModelOnly" and .["16"].class_type == "MiniMaxH3SigmaShift" and .["14"].class_type == "SaveVideo"' "$H3_WORKFLOW_API" \
   && echo "API workflow ready: $H3_WORKFLOW_API"
 ```
 
@@ -425,7 +455,7 @@ python tools/generate_minimax_h3_nsync_negatives.py \
   --dry-run
 ```
 
-`0.3` megapixels is a conservative starting point for a 24 GB GPU. On a larger GPU, increase it or omit `--generation-megapixels` to preserve the workflow's configured canvas area. The final negative is normalized to the positive's dimensions and duration either way.
+`0.3` megapixels matches the bundled workflow and is a conservative starting point for a 24 GB GPU. On a larger GPU, increase it if desired. The final negative is normalized to the positive's dimensions and duration either way.
 
 Generate one real pair before committing to the whole dataset:
 

@@ -25,6 +25,7 @@ class RunPodSetupScriptTest(unittest.TestCase):
             (comfy_root / "models" / "diffusion_models").mkdir(parents=True)
             (comfy_root / "models" / "text_encoders").mkdir(parents=True)
             (comfy_root / "models" / "vae").mkdir(parents=True)
+            (comfy_root / "models" / "loras").mkdir(parents=True)
             (comfy_root / "main.py").touch()
 
             model_paths = [
@@ -32,6 +33,7 @@ class RunPodSetupScriptTest(unittest.TestCase):
                 comfy_root / "models" / "text_encoders" / "qwen3vl_32b_minimax_h3_int8_convrot.safetensors",
                 comfy_root / "models" / "vae" / "minimax_h3_video_vae_fp16.safetensors",
                 comfy_root / "models" / "vae" / "minimax_h3_audio_vae_fp32.safetensors",
+                comfy_root / "models" / "loras" / "minimax_h3_fl2v_turbo_4step_v1.0_768p_comfyui_bf16.safetensors",
             ]
             for model_path in model_paths:
                 model_path.touch()
@@ -117,6 +119,8 @@ class RunPodSetupScriptTest(unittest.TestCase):
             self.assertEqual(workflow["2"]["inputs"]["clip_name"], model_paths[1].name)
             self.assertEqual(workflow["3"]["inputs"]["vae_name"], model_paths[2].name)
             self.assertEqual(workflow["4"]["inputs"]["vae_name"], model_paths[3].name)
+            self.assertEqual(workflow["15"]["inputs"]["lora_name"], model_paths[4].name)
+            self.assertIn(f"export H3_TURBO_LORA={model_paths[4]}", env_contents)
             self.assertIn(f"export H3_WORKFLOW_API={workflow_path}", env_contents)
 
             second_result = subprocess.run(
@@ -140,6 +144,7 @@ class RunPodSetupScriptTest(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("--comfy-root PATH", result.stdout)
+        self.assertIn("--turbo-lora PATH", result.stdout)
         self.assertIn("--rebuild-venv", result.stdout)
 
 

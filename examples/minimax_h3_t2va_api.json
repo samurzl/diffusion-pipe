@@ -49,9 +49,9 @@
         0
       ],
       "prompt": "A cinematic scene with natural motion and coherent audio.",
-      "width": 768,
-      "height": 448,
-      "length": 73
+      "width": 736,
+      "height": 416,
+      "length": 56
     },
     "class_type": "MiniMaxH3ImageToVideo",
     "_meta": {
@@ -70,7 +70,7 @@
   "7": {
     "inputs": {
       "model": [
-        "1",
+        "16",
         0
       ],
       "conditioning": [
@@ -85,7 +85,7 @@
   },
   "8": {
     "inputs": {
-      "sampler_name": "res_multistep"
+      "sampler_name": "euler"
     },
     "class_type": "KSamplerSelect",
     "_meta": {
@@ -95,11 +95,11 @@
   "9": {
     "inputs": {
       "model": [
-        "1",
+        "16",
         0
       ],
       "scheduler": "simple",
-      "steps": 20,
+      "steps": 6,
       "denoise": 1.0
     },
     "class_type": "BasicScheduler",
@@ -198,6 +198,34 @@
     "class_type": "SaveVideo",
     "_meta": {
       "title": "Save NSYNC negative"
+    }
+  },
+  "15": {
+    "inputs": {
+      "model": [
+        "1",
+        0
+      ],
+      "lora_name": "minimax_h3_fl2v_turbo_4step_v1.0_768p_comfyui_bf16.safetensors",
+      "strength_model": 1.0
+    },
+    "class_type": "LoraLoaderModelOnly",
+    "_meta": {
+      "title": "Load LightX2V MiniMax H3 Turbo 4-step LoRA"
+    }
+  },
+  "16": {
+    "inputs": {
+      "model": [
+        "15",
+        0
+      ],
+      "shift_video": 6.0,
+      "shift_audio": 3.0
+    },
+    "class_type": "MiniMaxH3SigmaShift",
+    "_meta": {
+      "title": "LightX2V Turbo sigma shifts"
     }
   }
 }
