@@ -58,6 +58,8 @@ DTYPE_NAMES = {
     'float8_e5m2',
 }
 
+TRAINING_DTYPE_NAMES = {'bfloat16', 'float16', 'float32'}
+
 TOP_LEVEL_KEYS = {
     'activation_checkpointing',
     'adapter',
@@ -209,6 +211,18 @@ DATASET_KEYS = {
     'subsample_ratio',
 }
 
+DATASET_ROOT_KEYS = DATASET_KEYS - {
+    'caption_path',
+    'control_path',
+    'default_mask_file',
+    'mask_path',
+    'nsync_pair',
+    'nsync_role',
+    'path',
+}
+
+DATASET_DIRECTORY_KEYS = DATASET_KEYS - {'directory', 'subsample_ratio'}
+
 BLOCK_SWAP_MODEL_TYPES = {
     'anima',
     'auraflow',
@@ -230,6 +244,11 @@ BLOCK_SWAP_MODEL_TYPES = {
     'z_image',
 }
 
+BLOCK_SWAP_LIMITS = {
+    'ltx2': 46,
+    'minimax_h3': 48,
+}
+
 MODEL_SUBMODULES = {
     'chroma': ('flow', 'src'),
     'cosmos': ('Cosmos', 'cosmos1'),
@@ -237,11 +256,20 @@ MODEL_SUBMODULES = {
     'hunyuan-video': ('HunyuanVideo', 'hyvideo'),
     'hunyuan_image': ('HunyuanImage-2.1', 'hyimage'),
     'ltx-video': ('LTX_Video', 'ltx_video'),
-    'lumina_2': ('Lumina_2', 'Lumina_2'),
+    'lumina_2': ('Lumina_2', 'models'),
     'omnigen2': ('OmniGen2', 'omnigen2'),
 }
 
 IGNORED_DATASET_SUFFIXES = {'.txt', '.npz', '.json', '.parquet', '.bak', '.db'}
+
+LOCAL_MODEL_FILE_SUFFIXES = {
+    '.bin',
+    '.ckpt',
+    '.gguf',
+    '.pt',
+    '.pth',
+    '.safetensors',
+}
 
 MODEL_REQUIRED_KEYS = {
     'auraflow': ('vae_path', 'text_encoder_path', 'transformer_path', 'max_sequence_length'),
@@ -340,11 +368,16 @@ def validate_preflight_dependencies(
             'adamw8bitkahan': 'bitsandbytes',
             'adamw_optimi': 'optimi',
             'stableadamw': 'optimi',
-            'offload': 'torchao',
-            'automagic': 'optimum',
-            'genericoptim': 'optimum',
+            'offload': 'torchao.prototype.low_bit_optim',
+            'automagic': 'optimum.quanto',
+            # GenericOptim is implemented locally and has no extra package.
+            'genericoptim': None,
         }.get(str(optimizer_type).lower())
-        if optimizer_module is None and str(optimizer_type).lower() not in ('adamw', 'sgd', ''):
+        known_without_extra_dependency = {'adamw', 'genericoptim', 'sgd', ''}
+        if (
+            optimizer_module is None
+            and str(optimizer_type).lower() not in known_without_extra_dependency
+        ):
             optimizer_module = 'pytorch_optimizer'
         if optimizer_module and not _module_available(optimizer_module):
             errors.append(
@@ -357,16 +390,20 @@ def validate_preflight_dependencies(
         isinstance(monitoring, dict)
         and monitoring.get('enable_wandb', False)
         and include_training_dependencies
+        and not cache_only
         and not _module_available('wandb')
     ):
         errors.append('monitoring.enable_wandb=true requires Python module "wandb"')
 
     if include_training_dependencies:
-        required_modules = (
+        required_modules = [
             'accelerate',
+            'av',
+            'comfy_aimdo',
             'datasets',
             'deepspeed',
             'diffusers',
+            'einops',
             'imageio',
             'multiprocess',
             'numpy',
@@ -379,7 +416,9 @@ def validate_preflight_dependencies(
             'torchvision',
             'tqdm',
             'transformers',
-        )
+        ]
+        if model_type == 'hunyuan-video':
+            required_modules.append('loguru')
         missing = [module for module in required_modules if not _module_available(module)]
         if missing:
             errors.append(f'missing required Python modules: {", ".join(missing)}')
@@ -404,6 +443,42 @@ def _validate_safetensors_header(path: Path, key: str, errors: list[str]) -> Non
             header = json.loads(handle.read(header_length))
             if not isinstance(header, dict):
                 raise ValueError('header is not a JSON object')
+            tensor_entries = {
+                name: metadata
+                for name, metadata in header.items()
+                if name != '__metadata__'
+            }
+            if not tensor_entries:
+                raise ValueError('header contains no tensors')
+            data_size = file_size - 8 - header_length
+            for name, metadata in tensor_entries.items():
+                if not isinstance(metadata, dict):
+                    raise ValueError(f'tensor {name!r} metadata is not an object')
+                dtype = metadata.get('dtype')
+                shape = metadata.get('shape')
+                offsets = metadata.get('data_offsets')
+                if not isinstance(dtype, str) or not dtype:
+                    raise ValueError(f'tensor {name!r} has no dtype')
+                if (
+                    not isinstance(shape, list)
+                    or not all(
+                        isinstance(dimension, int)
+                        and not isinstance(dimension, bool)
+                        and dimension >= 0
+                        for dimension in shape
+                    )
+                ):
+                    raise ValueError(f'tensor {name!r} has an invalid shape')
+                if (
+                    not isinstance(offsets, list)
+                    or len(offsets) != 2
+                    or not all(
+                        isinstance(offset, int) and not isinstance(offset, bool)
+                        for offset in offsets
+                    )
+                    or not 0 <= offsets[0] <= offsets[1] <= data_size
+                ):
+                    raise ValueError(f'tensor {name!r} has invalid data offsets')
     except (OSError, UnicodeDecodeError, ValueError, json.JSONDecodeError) as exc:
         errors.append(f'{key} is not a readable safetensors file: {path} ({exc})')
 
@@ -436,8 +511,12 @@ def _validate_checkpoint_run(path: Path, description: str, errors: list[str]) ->
         return
     if not tag:
         errors.append(f'checkpoint marker is empty: {latest}')
-    elif not (path / tag).is_dir():
-        errors.append(f'checkpoint marker {latest} points to missing directory: {path / tag}')
+        return
+    tag_path = path / tag
+    if not tag_path.is_dir():
+        errors.append(f'checkpoint marker {latest} points to missing directory: {tag_path}')
+    elif not any(tag_path.glob('*model_states.pt')):
+        errors.append(f'checkpoint directory contains no DeepSpeed model state files: {tag_path}')
 
 
 def _load_toml(path: Path, description: str, errors: list[str]) -> dict[str, Any] | None:
@@ -463,12 +542,6 @@ def _positive_int(value: Any) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and value > 0
 
 
-def _positive_integral_number(value: Any) -> bool:
-    return _positive_int(value) or (
-        isinstance(value, float) and value > 0 and value.is_integer()
-    )
-
-
 def _validate_batch_size(value: Any, key: str, errors: list[str]) -> None:
     if _positive_int(value):
         return
@@ -490,12 +563,19 @@ def _validate_batch_size(value: Any, key: str, errors: list[str]) -> None:
         seen_resolutions.add(resolution)
 
 
-def _validate_dtype(container: dict[str, Any], key: str, prefix: str, errors: list[str]) -> None:
+def _validate_dtype(
+    container: dict[str, Any],
+    key: str,
+    prefix: str,
+    errors: list[str],
+    *,
+    allowed: set[str] = DTYPE_NAMES,
+) -> None:
     if key not in container:
         return
     value = container[key]
-    if value not in DTYPE_NAMES:
-        errors.append(f'{prefix}{key} must be one of {sorted(DTYPE_NAMES)}, got {value!r}')
+    if value not in allowed:
+        errors.append(f'{prefix}{key} must be one of {sorted(allowed)}, got {value!r}')
 
 
 def _validate_explicit_local_path(value: Any, key: str, errors: list[str]) -> None:
@@ -504,16 +584,29 @@ def _validate_explicit_local_path(value: Any, key: str, errors: list[str]) -> No
         errors.append(f'{key} must be a non-empty string')
         return
     expanded = Path(value).expanduser()
-    explicitly_local = expanded.is_absolute() or value.startswith(('./', '../', '~/'))
+    explicitly_local = (
+        expanded.exists()
+        or expanded.is_absolute()
+        or value.startswith(('./', '../', '~/'))
+        or expanded.suffix.lower() in LOCAL_MODEL_FILE_SUFFIXES
+    )
     if not explicitly_local:
         return
     if not expanded.exists():
         errors.append(f'{key} points to a local path that does not exist: {value}')
         return
-    if not os.access(expanded, os.R_OK):
+    required_access = os.R_OK | os.X_OK if expanded.is_dir() else os.R_OK
+    if not os.access(expanded, required_access):
         errors.append(f'{key} points to a local path that is not readable: {value}')
         return
-    if expanded.is_file() and expanded.stat().st_size == 0:
+    if expanded.is_dir():
+        try:
+            next(expanded.iterdir())
+        except StopIteration:
+            errors.append(f'{key} points to an empty directory: {value}')
+        except OSError as exc:
+            errors.append(f'{key} directory could not be read: {value} ({exc})')
+    elif expanded.is_file() and expanded.stat().st_size == 0:
         errors.append(f'{key} points to an empty file: {value}')
     elif expanded.is_file() and expanded.suffix.lower() == '.safetensors':
         _validate_safetensors_header(expanded, key, errors)
@@ -545,7 +638,11 @@ def _validate_model_paths(model_config: dict[str, Any], errors: list[str]) -> No
     diffusers_path = model_config.get('diffusers_path')
     if isinstance(diffusers_path, str):
         expanded = Path(diffusers_path).expanduser()
-        explicitly_local = expanded.is_absolute() or diffusers_path.startswith(('./', '../', '~/'))
+        explicitly_local = (
+            expanded.exists()
+            or expanded.is_absolute()
+            or diffusers_path.startswith(('./', '../', '~/'))
+        )
         if explicitly_local and expanded.is_dir() and not (expanded / 'model_index.json').is_file():
             errors.append(f'model.diffusers_path is missing model_index.json: {diffusers_path}')
 
@@ -689,6 +786,13 @@ def _validate_main_config(
     partition_method = config.get('partition_method', 'parameters')
     if not isinstance(partition_method, str) or not partition_method:
         errors.append('partition_method must be a non-empty string')
+    elif not (
+        partition_method in ('manual', 'parameters', 'uniform')
+        or (partition_method.startswith('type:') and len(partition_method) > len('type:'))
+    ):
+        errors.append(
+            'partition_method must be manual, parameters, uniform, or type:<layer-name>'
+        )
     partition_split = config.get('partition_split')
     if partition_method == 'manual':
         if not isinstance(partition_split, list):
@@ -699,6 +803,8 @@ def _validate_main_config(
             errors.append('every partition_split entry must be a positive integer layer index')
         elif partition_split != sorted(set(partition_split)):
             errors.append('partition_split entries must be unique and strictly increasing')
+    elif partition_split is not None:
+        errors.append('partition_split is only used when partition_method="manual"')
 
     activation_checkpointing = config.get('activation_checkpointing', False)
     if activation_checkpointing not in (False, True, 'unsloth'):
@@ -753,7 +859,13 @@ def _validate_main_config(
             errors.append('model.type="qwen_image" requires diffusers_path or all of text_encoder_path, vae_path, and transformer_path')
     if 'dtype' not in model_config:
         errors.append('model.dtype is required')
-    _validate_dtype(model_config, 'dtype', 'model.', errors)
+    _validate_dtype(
+        model_config,
+        'dtype',
+        'model.',
+        errors,
+        allowed=TRAINING_DTYPE_NAMES,
+    )
     _validate_dtype(model_config, 'transformer_dtype', 'model.', errors)
     _validate_dtype(model_config, 'diffusion_model_dtype', 'model.', errors)
     _validate_model_paths(model_config, errors)
@@ -766,9 +878,50 @@ def _validate_main_config(
     for key in ('guidance', 'shift', 'sigmoid_scale', 'image_shift'):
         if key in model_config and not _positive_number(model_config[key]):
             errors.append(f'model.{key} must be a positive number')
-    for key in ('cache_text_embeddings', 'flux_shift', 'text_encoder_fp8', 'text_encoder_nf4'):
+    for key in (
+        'bypass_guidance_embedding',
+        'cache_text_embeddings',
+        'debiased_estimation_loss',
+        'flux_shift',
+        'llama3_4bit',
+        'lumina_shift',
+        'text_encoder_fp8',
+        'text_encoder_nf4',
+        'v_pred',
+    ):
         if key in model_config and not isinstance(model_config[key], bool):
             errors.append(f'model.{key} must be true or false')
+    for key in ('max_llama3_sequence_length', 'max_sequence_length'):
+        if key in model_config and not _positive_int(model_config[key]):
+            errors.append(f'model.{key} must be a positive integer')
+    for key in (
+        'cross_attn_lr',
+        'llm_adapter_lr',
+        'mlp_lr',
+        'mod_lr',
+        'self_attn_lr',
+        'text_encoder_1_lr',
+        'text_encoder_2_lr',
+        'unet_lr',
+    ):
+        if key in model_config:
+            value = model_config[key]
+            if (
+                not isinstance(value, (int, float))
+                or isinstance(value, bool)
+                or value < 0
+            ):
+                errors.append(f'model.{key} must be a non-negative number')
+    if 'min_snr_gamma' in model_config and not _positive_number(model_config['min_snr_gamma']):
+        errors.append('model.min_snr_gamma must be a positive number')
+    if 'multiscale_loss_weight' in model_config:
+        value = model_config['multiscale_loss_weight']
+        if (
+            not isinstance(value, (int, float))
+            or isinstance(value, bool)
+            or value < 0
+        ):
+            errors.append('model.multiscale_loss_weight must be a non-negative number')
     if 'first_frame_conditioning_p' in model_config:
         value = model_config['first_frame_conditioning_p']
         if not isinstance(value, (int, float)) or isinstance(value, bool) or not 0 <= value <= 1:
@@ -783,8 +936,6 @@ def _validate_main_config(
         or not 0 <= min_t < max_t <= 1
     ):
         errors.append('model.min_t and model.max_t must satisfy 0 <= min_t < max_t <= 1')
-    if model_type == 'auraflow' and not _positive_int(model_config.get('max_sequence_length')):
-        errors.append('model.max_sequence_length must be a positive integer')
     if model_type == 'minimax_h3':
         mode = model_config.get('mode', 't2v')
         if not isinstance(mode, str) or mode.lower() not in ('t2v', 'i2v'):
@@ -807,17 +958,59 @@ def _validate_main_config(
             adapter_type = adapter_config.get('type')
             if adapter_type not in ('lora', 'lokr'):
                 errors.append(f'adapter.type must be lora or lokr, got {adapter_type!r}')
-            if not _positive_integral_number(adapter_config.get('rank')):
-                errors.append('adapter.rank must be a positive integer value')
+            if not _positive_int(adapter_config.get('rank')):
+                errors.append('adapter.rank must be a positive integer')
             if 'alpha' in adapter_config:
                 errors.append('adapter.alpha is not supported; it is always set equal to adapter.rank')
-            _validate_dtype(adapter_config, 'dtype', 'adapter.', errors)
+            _validate_dtype(
+                adapter_config,
+                'dtype',
+                'adapter.',
+                errors,
+                allowed=TRAINING_DTYPE_NAMES,
+            )
+            if 'exclude_modules' in adapter_config:
+                exclude_modules = adapter_config['exclude_modules']
+                valid_exclusions = (
+                    isinstance(exclude_modules, str)
+                    and bool(exclude_modules)
+                ) or (
+                    isinstance(exclude_modules, list)
+                    and all(isinstance(value, str) for value in exclude_modules)
+                )
+                if not valid_exclusions:
+                    errors.append('adapter.exclude_modules must be a string or a list of strings')
+            if adapter_type == 'lora' and 'dropout' in adapter_config:
+                dropout = adapter_config['dropout']
+                if (
+                    not isinstance(dropout, (int, float))
+                    or isinstance(dropout, bool)
+                    or not 0 <= dropout <= 1
+                ):
+                    errors.append('adapter.dropout must be a number in [0, 1]')
+            if adapter_type == 'lokr':
+                if 'decompose_factor' in adapter_config:
+                    factor = adapter_config['decompose_factor']
+                    if not isinstance(factor, int) or isinstance(factor, bool) or factor == 0 or factor < -1:
+                        errors.append('adapter.decompose_factor must be -1 or a positive integer')
+                if 'rank_dropout' in adapter_config:
+                    rank_dropout = adapter_config['rank_dropout']
+                    if (
+                        not isinstance(rank_dropout, (int, float))
+                        or isinstance(rank_dropout, bool)
+                        or not 0 <= rank_dropout <= 1
+                    ):
+                        errors.append('adapter.rank_dropout must be a number in [0, 1]')
             if 'init_from_existing' in adapter_config:
                 _validate_explicit_local_path(adapter_config['init_from_existing'], 'adapter.init_from_existing', errors)
                 adapter_path = adapter_config['init_from_existing']
                 if isinstance(adapter_path, str):
                     expanded = Path(adapter_path).expanduser()
-                    explicitly_local = expanded.is_absolute() or adapter_path.startswith(('./', '../', '~/'))
+                    explicitly_local = (
+                        expanded.exists()
+                        or expanded.is_absolute()
+                        or adapter_path.startswith(('./', '../', '~/'))
+                    )
                     if explicitly_local and expanded.exists():
                         if not expanded.is_dir():
                             errors.append('adapter.init_from_existing must be an adapter directory')
@@ -827,6 +1020,12 @@ def _validate_main_config(
                                 errors.append(
                                     'adapter.init_from_existing must contain exactly one .safetensors file; '
                                     f'found {len(weights)} in {expanded}'
+                                )
+                            else:
+                                _validate_safetensors_header(
+                                    weights[0],
+                                    'adapter.init_from_existing weights',
+                                    errors,
                                 )
 
     optimizer_config = config.get('optimizer')
@@ -842,13 +1041,25 @@ def _validate_main_config(
     if 'betas' in optimizer_config:
         betas = optimizer_config['betas']
         beta2_upper_inclusive = str(optimizer_config.get('type', '')).lower() == 'genericoptim'
+        valid_beta2 = (
+            isinstance(betas, list)
+            and len(betas) == 2
+            and isinstance(betas[1], (int, float))
+            and not isinstance(betas[1], bool)
+        )
+        if valid_beta2:
+            valid_beta2 = (
+                0 <= betas[1] <= 1
+                if beta2_upper_inclusive
+                else 0 <= betas[1] < 1
+            )
         if (
             not isinstance(betas, list)
             or len(betas) != 2
             or not isinstance(betas[0], (int, float))
+            or isinstance(betas[0], bool)
             or not 0 <= betas[0] < 1
-            or not isinstance(betas[1], (int, float))
-            or not 0 <= betas[1] <= (1 if beta2_upper_inclusive else 1 - 1e-15)
+            or not valid_beta2
         ):
             range_description = '[0, 1]' if beta2_upper_inclusive else '[0, 1)'
             errors.append(f'optimizer.betas must contain two numbers in the range {range_description}')
@@ -868,6 +1079,11 @@ def _validate_main_config(
             errors.append('blocks_to_swap requires a LoRA adapter')
         if model_type not in BLOCK_SWAP_MODEL_TYPES:
             errors.append(f'blocks_to_swap is not implemented for model.type={model_type!r}')
+        elif model_type in BLOCK_SWAP_LIMITS and blocks_to_swap > BLOCK_SWAP_LIMITS[model_type]:
+            errors.append(
+                f'blocks_to_swap cannot exceed {BLOCK_SWAP_LIMITS[model_type]} '
+                f'for model.type={model_type!r}'
+            )
 
     training_methods = config.get('training_methods', {})
     if not isinstance(training_methods, dict):
@@ -1155,12 +1371,13 @@ def _validate_dataset_config(
     dataset_config: dict[str, Any],
     description: str,
     *,
+    inspect_media: bool,
     skip_dataset_validation: bool,
     nsync_expected: bool,
     model_type: str | None,
     errors: list[str],
 ) -> None:
-    _validate_known_keys(dataset_config, DATASET_KEYS, description, errors)
+    _validate_known_keys(dataset_config, DATASET_ROOT_KEYS, description, errors)
     directories = dataset_config.get('directory')
     if not isinstance(directories, list) or not directories:
         errors.append(f'{description}.directory must contain at least one [[directory]] table')
@@ -1191,7 +1408,7 @@ def _validate_dataset_config(
         if not isinstance(directory, dict):
             errors.append(f'{prefix} must be a table')
             continue
-        _validate_known_keys(directory, DATASET_KEYS - {'directory', 'subsample_ratio'}, prefix, errors)
+        _validate_known_keys(directory, DATASET_DIRECTORY_KEYS, prefix, errors)
 
         media_path_value = directory.get('path')
         media_names: list[str] = []
@@ -1201,21 +1418,40 @@ def _validate_dataset_config(
             media_path = Path(media_path_value).expanduser()
             if not media_path.is_dir():
                 errors.append(f'{prefix}.path is not a directory: {media_path_value}')
+            elif not os.access(media_path, os.R_OK | os.X_OK):
+                errors.append(f'{prefix}.path is not readable: {media_path_value}')
             else:
-                media_names = _inspect_dataset_media(media_path, f'{prefix}.path', errors)
-                if not media_names:
-                    errors.append(f'{prefix}.path contains no images, videos, or tar archives: {media_path_value}')
+                if inspect_media:
+                    media_names = _inspect_dataset_media(media_path, f'{prefix}.path', errors)
+                    if not media_names:
+                        errors.append(f'{prefix}.path contains no images, videos, or tar archives: {media_path_value}')
+                cache_path = media_path / 'cache'
+                if cache_path.exists() and not cache_path.is_dir():
+                    errors.append(f'{prefix}.path has a cache path that is not a directory: {cache_path}')
+                elif not os.access(
+                    cache_path if cache_path.exists() else media_path,
+                    os.W_OK | os.X_OK,
+                ):
+                    errors.append(
+                        f'{prefix}.path cannot create or update its dataset cache under: {media_path}'
+                    )
 
         for key in ('caption_path', 'mask_path', 'control_path'):
             if key not in directory:
                 continue
             value = directory[key]
-            if not isinstance(value, str) or not Path(value).expanduser().is_dir():
+            expanded = Path(value).expanduser() if isinstance(value, str) else None
+            if expanded is None or not expanded.is_dir():
                 errors.append(f'{prefix}.{key} is not a directory: {value!r}')
+            elif not os.access(expanded, os.R_OK | os.X_OK):
+                errors.append(f'{prefix}.{key} is not readable: {value!r}')
         if 'default_mask_file' in directory:
             value = directory['default_mask_file']
-            if not isinstance(value, str) or not Path(value).expanduser().is_file():
+            expanded = Path(value).expanduser() if isinstance(value, str) else None
+            if expanded is None or not expanded.is_file():
                 errors.append(f'{prefix}.default_mask_file is not a file: {value!r}')
+            elif not os.access(expanded, os.R_OK):
+                errors.append(f'{prefix}.default_mask_file is not readable: {value!r}')
 
         for key in ('enable_ar_bucket', 'online_captions', 'shuffle_metadata', 'shuffle_tags', 'skip_empty_caption'):
             value = _effective_dataset_value(directory, dataset_config, key)
@@ -1281,8 +1517,21 @@ def _validate_dataset_config(
         if isinstance(caption_dir_value, str) and Path(caption_dir_value).expanduser().is_dir():
             caption_dir = Path(caption_dir_value).expanduser()
             caption_json_path = caption_dir / 'captions.json'
-            caption_map = _load_caption_map(caption_json_path, f'{prefix}.captions.json', errors)
-            if _effective_dataset_value(directory, dataset_config, 'online_captions', False) and caption_map is None:
+            online_captions = _effective_dataset_value(
+                directory,
+                dataset_config,
+                'online_captions',
+                False,
+            )
+            caption_map = (
+                _load_caption_map(caption_json_path, f'{prefix}.captions.json', errors)
+                if inspect_media
+                else None
+            )
+            if online_captions and (
+                not caption_json_path.is_file()
+                or (inspect_media and caption_map is None)
+            ):
                 errors.append(f'{prefix} enables online_captions but captions.json was not found or valid in {caption_dir_value}')
 
             captioned_media = 0
@@ -1303,14 +1552,18 @@ def _validate_dataset_config(
                 captioned_media += count > 0
 
             skip_empty_caption = _effective_dataset_value(directory, dataset_config, 'skip_empty_caption', True)
-            if skip_empty_caption is True and media_names and captioned_media == 0:
+            if inspect_media and skip_empty_caption is True and media_names and captioned_media == 0:
                 errors.append(
                     f'{prefix} would be empty because skip_empty_caption=true and none of its '
                     'media files has a caption'
                 )
 
         control_path_value = directory.get('control_path')
-        if isinstance(control_path_value, str) and Path(control_path_value).expanduser().is_dir():
+        if (
+            inspect_media
+            and isinstance(control_path_value, str)
+            and Path(control_path_value).expanduser().is_dir()
+        ):
             try:
                 control_stems = {
                     path.stem for path in Path(control_path_value).expanduser().iterdir() if path.is_file()
@@ -1441,10 +1694,11 @@ def load_and_validate_config(
     config_path: str | os.PathLike[str],
     *,
     skip_dataset_validation: bool = False,
+    inspect_dataset_media: bool = True,
     world_size: int | None = None,
     resume_from_checkpoint: bool | str | None = None,
 ) -> tuple[dict[str, Any], dict[str, dict[str, Any]]]:
-    """Load the main/dataset TOML files and report all cheap validation errors."""
+    """Load the main/dataset TOML files and report validation errors by cost."""
     errors: list[str] = []
     path = Path(config_path).expanduser()
     config = _load_toml(path, 'training config', errors)
@@ -1457,6 +1711,10 @@ def load_and_validate_config(
         resume_from_checkpoint=resume_from_checkpoint,
         errors=errors,
     )
+    # Do not touch dataset files when the main configuration is already known
+    # to be invalid. Dataset trees can contain hundreds of thousands of files.
+    if errors:
+        raise ConfigValidationError(errors)
 
     dataset_configs: dict[str, dict[str, Any]] = {}
     dataset_path_value = config.get('dataset')
@@ -1469,6 +1727,11 @@ def load_and_validate_config(
     seen_eval_names = set()
     for index, entry in enumerate(eval_datasets):
         if isinstance(entry, str):
+            generated_name = f'eval{index}'
+            if generated_name in seen_eval_names:
+                errors.append(f'eval_datasets contains duplicate name {generated_name!r}')
+            else:
+                seen_eval_names.add(generated_name)
             dataset_entries.append((f'eval_datasets[{index}]', entry))
         elif isinstance(entry, dict):
             _validate_known_keys(entry, {'config', 'name'}, f'eval_datasets[{index}]', errors)
@@ -1493,6 +1756,7 @@ def load_and_validate_config(
     model_config = config.get('model', {})
     model_type = model_config.get('type') if isinstance(model_config, dict) else None
 
+    loaded_dataset_entries: list[tuple[str, dict[str, Any]]] = []
     for description, dataset_path_value in dataset_entries:
         if not isinstance(dataset_path_value, str) or not dataset_path_value:
             errors.append(f'{description} must be a non-empty TOML file path')
@@ -1502,14 +1766,37 @@ def load_and_validate_config(
         if dataset_config is None:
             continue
         dataset_configs[str(dataset_path)] = dataset_config
+        loaded_dataset_entries.append((description, dataset_config))
+
+    # Parse every dataset TOML before validating any of them. A syntax error in
+    # a later eval dataset should not be hidden behind a scan of the train set.
+    if errors:
+        raise ConfigValidationError(errors)
+
+    for description, dataset_config in loaded_dataset_entries:
         _validate_dataset_config(
             dataset_config,
             description,
+            inspect_media=False,
             skip_dataset_validation=skip_dataset_validation,
             nsync_expected=nsync_expected,
             model_type=model_type,
             errors=errors,
         )
+
+    if errors:
+        raise ConfigValidationError(errors)
+    if inspect_dataset_media:
+        for description, dataset_config in loaded_dataset_entries:
+            _validate_dataset_config(
+                dataset_config,
+                description,
+                inspect_media=True,
+                skip_dataset_validation=skip_dataset_validation,
+                nsync_expected=nsync_expected,
+                model_type=model_type,
+                errors=errors,
+            )
 
     if errors:
         raise ConfigValidationError(errors)

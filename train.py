@@ -1,6 +1,5 @@
 import argparse
 import os
-import sys
 import json
 from pathlib import Path
 
@@ -9,6 +8,42 @@ from utils.config_validation import (
     load_and_validate_config,
     validate_preflight_dependencies,
 )
+
+
+def validate_runtime_environment(args, torch_module):
+    """Fail before dataset inspection if the launcher or CUDA topology is unusable."""
+    errors = []
+    world_size = int(os.getenv('WORLD_SIZE', '1'))
+    rank = int(os.getenv('RANK', '0'))
+    if not 0 <= rank < world_size:
+        errors.append(f'RANK ({rank}) must be in [0, WORLD_SIZE={world_size})')
+
+    environment_local_rank = int(os.getenv('LOCAL_RANK', '-1'))
+    local_rank = args.local_rank if args.local_rank >= 0 else environment_local_rank
+    if local_rank < 0 and world_size == 1:
+        local_rank = 0
+    if local_rank < 0:
+        errors.append('local rank is missing; launch training with DeepSpeed or set LOCAL_RANK')
+
+    if not torch_module.cuda.is_available():
+        errors.append('CUDA is not available to PyTorch')
+    else:
+        device_count = torch_module.cuda.device_count()
+        if local_rank >= device_count:
+            errors.append(
+                f'LOCAL_RANK ({local_rank}) has no CUDA device; PyTorch sees {device_count} device(s)'
+            )
+        if 'LOCAL_WORLD_SIZE' in os.environ:
+            local_world_size = int(os.environ['LOCAL_WORLD_SIZE'])
+            if local_world_size > device_count:
+                errors.append(
+                    f'LOCAL_WORLD_SIZE ({local_world_size}) exceeds the {device_count} CUDA device(s) '
+                    'visible to PyTorch'
+                )
+
+    if errors:
+        raise ConfigValidationError(errors)
+    args.local_rank = local_rank
 
 
 # Run a cheap, dependency-light preflight before importing torch, DeepSpeed,
@@ -39,7 +74,6 @@ parser.add_argument('--deepspeed', action='store_true')
 parser.add_argument('--deepspeed_config', default=None)
 parser.add_argument('--deepscale', action='store_true')
 parser.add_argument('--deepscale_config', default=None)
-parser.add_argument('--deepspeed_mpi', action='store_true')
 args = parser.parse_args()
 
 _preflight_config = None
@@ -47,6 +81,7 @@ _preflight_dataset_configs = {}
 try:
     environment_errors = []
     world_size = None
+    environment_values = {'WORLD_SIZE': 1, 'RANK': 0}
     for name in ('WORLD_SIZE', 'RANK', 'LOCAL_RANK', 'LOCAL_WORLD_SIZE'):
         if name not in os.environ:
             continue
@@ -59,29 +94,72 @@ try:
             environment_errors.append(f'environment variable {name} must be positive, got {value}')
         elif name in ('RANK', 'LOCAL_RANK') and value < 0:
             environment_errors.append(f'environment variable {name} must be non-negative, got {value}')
+        environment_values[name] = value
         if name == 'WORLD_SIZE':
             world_size = value
+    if not environment_errors:
+        if environment_values['RANK'] >= environment_values['WORLD_SIZE']:
+            environment_errors.append(
+                f'environment variable RANK ({environment_values["RANK"]}) must be smaller than '
+                f'WORLD_SIZE ({environment_values["WORLD_SIZE"]})'
+            )
+        if (
+            'LOCAL_RANK' in environment_values
+            and 'LOCAL_WORLD_SIZE' in environment_values
+            and environment_values['LOCAL_RANK'] >= environment_values['LOCAL_WORLD_SIZE']
+        ):
+            environment_errors.append(
+                f'environment variable LOCAL_RANK ({environment_values["LOCAL_RANK"]}) must be '
+                f'smaller than LOCAL_WORLD_SIZE ({environment_values["LOCAL_WORLD_SIZE"]})'
+            )
     if not 1 <= args.master_port <= 65535:
         environment_errors.append(f'--master_port must be in [1, 65535], got {args.master_port}')
     if environment_errors:
         raise ConfigValidationError(environment_errors)
 
+    validation_world_size = (
+        world_size
+        if world_size is not None
+        else (None if args.validate_only else 1)
+    )
+
     _preflight_config, _preflight_dataset_configs = load_and_validate_config(
         args.config,
         skip_dataset_validation=args.i_know_what_i_am_doing,
-        world_size=world_size,
+        inspect_dataset_media=False,
+        world_size=validation_world_size,
         resume_from_checkpoint=args.resume_from_checkpoint,
     )
+    cli_errors = []
     if args.dump_dataset and _preflight_config.get('model', {}).get('type') != 'flux':
-        raise ConfigValidationError(['--dump_dataset is currently implemented only for model.type="flux"'])
+        cli_errors.append('--dump_dataset is currently implemented only for model.type="flux"')
+    if args.dump_dataset:
+        dump_path = args.dump_dataset.expanduser()
+        if dump_path.exists() and not dump_path.is_dir():
+            cli_errors.append(f'--dump_dataset exists but is not a directory: {dump_path}')
+        else:
+            dump_parent = dump_path
+            while not dump_parent.exists() and dump_parent != dump_parent.parent:
+                dump_parent = dump_parent.parent
+            if not dump_parent.is_dir() or not os.access(dump_parent, os.W_OK | os.X_OK):
+                cli_errors.append(f'--dump_dataset cannot be created or written under: {dump_parent}')
+    if args.test_sample and not os.access(Path.cwd(), os.W_OK | os.X_OK):
+        cli_errors.append(f'--test_sample cannot write example.png in the current directory: {Path.cwd()}')
+    if args.deepspeed_config is not None or args.deepscale_config is not None:
+        cli_errors.append(
+            '--deepspeed_config/--deepscale_config cannot be combined with this script because '
+            'train.py builds and passes its DeepSpeed configuration internally'
+        )
     if (
         (args.reset_dataloader or args.reset_optimizer or args.reset_optimizer_params)
         and args.resume_from_checkpoint is None
         and not _preflight_config.get('resume_from_checkpoint', False)
     ):
-        raise ConfigValidationError([
+        cli_errors.append(
             '--reset_dataloader, --reset_optimizer, and --reset_optimizer_params require resuming from a checkpoint'
-        ])
+        )
+    if cli_errors:
+        raise ConfigValidationError(cli_errors)
     validate_preflight_dependencies(
         _preflight_config,
         repository_root=Path(__file__).resolve().parent,
@@ -92,8 +170,33 @@ except ConfigValidationError as exc:
     raise SystemExit(f'\n{exc}') from None
 
 if args.validate_only:
+    try:
+        _preflight_config, _preflight_dataset_configs = load_and_validate_config(
+            args.config,
+            skip_dataset_validation=args.i_know_what_i_am_doing,
+            world_size=validation_world_size,
+            resume_from_checkpoint=args.resume_from_checkpoint,
+        )
+    except ConfigValidationError as exc:
+        raise SystemExit(f'\n{exc}') from None
     print(f'Configuration is valid: {args.config}')
     raise SystemExit(0)
+
+
+import torch
+
+try:
+    validate_runtime_environment(args, torch)
+    # File enumeration, caption/control matching, and tar inspection are the
+    # final preflight stage because they can be slow for very large datasets.
+    _preflight_config, _preflight_dataset_configs = load_and_validate_config(
+        args.config,
+        skip_dataset_validation=args.i_know_what_i_am_doing,
+        world_size=validation_world_size,
+        resume_from_checkpoint=args.resume_from_checkpoint,
+    )
+except ConfigValidationError as exc:
+    raise SystemExit(f'\n{exc}') from None
 
 
 from datetime import datetime, timezone
@@ -108,7 +211,6 @@ from collections import defaultdict
 import deepspeed
 from deepspeed import comm as dist
 from deepspeed.runtime.pipe import module as ds_pipe_module
-import torch
 from torch import nn
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
@@ -250,22 +352,50 @@ def validate_optimizer_availability(config):
         'genericoptim': ('optimizers.generic_optim', 'GenericOptim'),
         'adamw8bitkahan': ('optimizers.adamw_8bit', 'AdamW8bitKahan'),
     }
-    if optim_type_lower in ('adamw', 'sgd'):
-        return
-    if optim_type_lower in module_and_attribute:
+    if optim_type_lower == 'adamw':
+        value = torch.optim.AdamW
+    elif optim_type_lower == 'sgd':
+        value = torch.optim.SGD
+    elif optim_type_lower in module_and_attribute:
         module_name, attribute_path = module_and_attribute[optim_type_lower]
+        try:
+            value = importlib.import_module(module_name)
+            for attribute in attribute_path.split('.'):
+                value = getattr(value, attribute)
+        except (ImportError, AttributeError) as exc:
+            raise ConfigValidationError([
+                f'optimizer {optim_type!r} is unavailable; check optimizer.type and install its '
+                f'optional dependency ({exc})'
+            ]) from None
     else:
         module_name, attribute_path = 'pytorch_optimizer', optim_type
+        try:
+            value = importlib.import_module(module_name)
+            for attribute in attribute_path.split('.'):
+                value = getattr(value, attribute)
+        except (ImportError, AttributeError) as exc:
+            raise ConfigValidationError([
+                f'optimizer {optim_type!r} is unavailable; check optimizer.type and install its '
+                f'optional dependency ({exc})'
+            ]) from None
 
     try:
-        value = importlib.import_module(module_name)
-        for attribute in attribute_path.split('.'):
-            value = getattr(value, attribute)
-    except (ImportError, AttributeError) as exc:
-        raise ValueError(
-            f'Optimizer {optim_type!r} is unavailable. Check optimizer.type and install its optional dependency. '
-            f'Underlying error: {exc}'
-        ) from None
+        signature = inspect.signature(value)
+    except (TypeError, ValueError):
+        return
+    if not any(
+        parameter.kind == inspect.Parameter.VAR_KEYWORD
+        for parameter in signature.parameters.values()
+    ):
+        ignored_keys = {'beta2_half_life', 'gradient_release', 'type'}
+        configured_keys = set(config['optimizer']) - ignored_keys
+        accepted_keys = set(signature.parameters) - {'params'}
+        unknown_keys = sorted(configured_keys - accepted_keys)
+        if unknown_keys:
+            raise ConfigValidationError([
+                f'optimizer {optim_type!r} does not accept configured parameter(s): '
+                f'{", ".join(unknown_keys)}'
+            ])
 
 
 MODEL_PIPELINES = {
@@ -297,47 +427,10 @@ MODEL_PIPELINES = {
 
 
 def resolve_model_pipeline(model_type):
-    """Import the selected implementation before distributed/CUDA initialization."""
+    """Import the selected implementation before distributed initialization."""
     module_name, class_name = MODEL_PIPELINES[model_type]
     module = importlib.import_module(module_name)
     return getattr(module, class_name)
-
-
-def validate_runtime_environment(args):
-    """Fail before distributed setup if the launcher or CUDA topology is unusable."""
-    errors = []
-    world_size = int(os.getenv('WORLD_SIZE', '1'))
-    rank = int(os.getenv('RANK', '0'))
-    if not 0 <= rank < world_size:
-        errors.append(f'RANK ({rank}) must be in [0, WORLD_SIZE={world_size})')
-
-    environment_local_rank = int(os.getenv('LOCAL_RANK', '-1'))
-    local_rank = args.local_rank if args.local_rank >= 0 else environment_local_rank
-    if local_rank < 0 and world_size == 1:
-        local_rank = 0
-    if local_rank < 0:
-        errors.append('local rank is missing; launch training with DeepSpeed or set LOCAL_RANK')
-
-    if not torch.cuda.is_available():
-        errors.append('CUDA is not available to PyTorch')
-    else:
-        device_count = torch.cuda.device_count()
-        if local_rank >= device_count:
-            errors.append(
-                f'LOCAL_RANK ({local_rank}) has no CUDA device; PyTorch sees {device_count} device(s)'
-            )
-        if 'LOCAL_WORLD_SIZE' in os.environ:
-            local_world_size = int(os.environ['LOCAL_WORLD_SIZE'])
-            if local_world_size > device_count:
-                errors.append(
-                    f'LOCAL_WORLD_SIZE ({local_world_size}) exceeds the {device_count} CUDA device(s) '
-                    'visible to PyTorch'
-                )
-
-    if errors:
-        raise ConfigValidationError(errors)
-    args.local_rank = local_rank
-    return world_size, rank, local_rank
 
 
 def get_most_recent_run_dir(output_dir):
@@ -479,14 +572,16 @@ if __name__ == '__main__':
 
     set_config_defaults(config)
     if not args.cache_only:
-        validate_optimizer_availability(config)
-    model_pipeline_class = resolve_model_pipeline(config['model']['type'])
-    validate_runtime_environment(args)
+        try:
+            validate_optimizer_availability(config)
+        except ConfigValidationError as exc:
+            raise SystemExit(f'\n{exc}') from None
 
     # With multiple GPUs / large batch sizes, the dataloader can trigger "too many open files" errors unless we do this.
     torch.multiprocessing.set_sharing_strategy('file_system')
     deepspeed.utils.set_log_level_from_string('info')
     apply_patches()
+    model_pipeline_class = resolve_model_pipeline(config['model']['type'])
 
     common.AUTOCAST_DTYPE = config['model']['dtype']
     dataset_util.UNCOND_FRACTION = config.get('uncond_fraction', 0.0)
@@ -511,7 +606,6 @@ if __name__ == '__main__':
         else config.get('regenerate_cache', False)
     )
 
-    model_type = config['model']['type']
     model = model_pipeline_class(config)
 
     # import sys, PIL

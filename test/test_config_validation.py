@@ -3,6 +3,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from utils.config_validation import ConfigValidationError, load_and_validate_config
 
@@ -19,6 +20,7 @@ class ConfigValidationTest(unittest.TestCase):
         (media_dir / 'example.png').write_bytes(b'not decoded during preflight')
         (media_dir / 'example.txt').write_text('an example caption')
         model_dir.mkdir()
+        (model_dir / 'weights.bin').write_bytes(b'placeholder')
         dataset_path = root / 'dataset.toml'
         dataset_path.write_text(
             f'''\
@@ -103,6 +105,22 @@ dtype = 'half-ish'
         self.assertIn('Configuration is valid', result.stdout)
         self.assertNotIn('DeepSpeed', result.stdout + result.stderr)
 
+    def test_toml_syntax_error_exits_before_training_imports(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / 'broken.toml'
+            config_path.write_text('[model\ntype = "wan"')
+            result = subprocess.run(
+                [sys.executable, 'train.py', '--validate_only', '--config', str(config_path)],
+                cwd=REPO_ROOT,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('Could not read training config', result.stderr)
+        self.assertNotIn('ModuleNotFoundError', result.stderr)
+
     def test_cli_typo_fails_before_training_imports(self):
         with tempfile.TemporaryDirectory() as tmp:
             config_path = self._write_valid_config(Path(tmp))
@@ -116,6 +134,19 @@ dtype = 'half-ish'
 
         self.assertNotEqual(result.returncode, 0)
         self.assertIn('unrecognized arguments: --loging_steps 2', result.stderr)
+        self.assertNotIn('ModuleNotFoundError', result.stderr)
+
+    def test_help_exits_before_training_imports(self):
+        result = subprocess.run(
+            [sys.executable, 'train.py', '--help'],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('--validate_only', result.stdout)
         self.assertNotIn('ModuleNotFoundError', result.stderr)
 
     def test_unknown_keys_and_late_scalar_errors_are_aggregated(self):
@@ -136,6 +167,39 @@ dtype = 'half-ish'
         self.assertIn('save_dtype', message)
         self.assertIn('video_clip_mode', message)
         self.assertIn('timestep_sample_method', message)
+
+    def test_main_config_errors_do_not_scan_dataset_media(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_path = self._write_valid_config(root)
+            config_path.write_text(config_path.read_text().replace('epochs = 10', 'epochs = 0'))
+
+            with patch('utils.config_validation._inspect_dataset_media') as inspect_media:
+                with self.assertRaises(ConfigValidationError) as caught:
+                    load_and_validate_config(config_path)
+
+        self.assertIn('epochs', str(caught.exception))
+        inspect_media.assert_not_called()
+
+    def test_dataset_structure_errors_do_not_scan_dataset_media(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_path = self._write_valid_config(root)
+            (root / 'dataset.toml').write_text(
+                f'''\
+resolutions = []
+
+[[directory]]
+path = {str(root / 'media')!r}
+'''
+            )
+
+            with patch('utils.config_validation._inspect_dataset_media') as inspect_media:
+                with self.assertRaises(ConfigValidationError) as caught:
+                    load_and_validate_config(config_path)
+
+        self.assertIn('needs non-empty resolutions', str(caught.exception))
+        inspect_media.assert_not_called()
 
     def test_dataset_metadata_failures_are_reported_before_caching(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -165,7 +229,27 @@ control_path = {str(control_dir)!r}
         self.assertIn('would be empty', message)
         self.assertIn('missing control files', message)
 
-    def test_nsync_pairing_is_checked_without_scanning_media(self):
+    def test_corrupt_safetensors_header_is_rejected_without_loading_weights(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_path = self._write_valid_config(root)
+            broken_weights = root / 'broken.safetensors'
+            broken_weights.write_bytes(b'not a safetensors file')
+            config_path.write_text(
+                config_path.read_text()
+                .replace("type = 'wan'", "type = 'sdxl'")
+                .replace(
+                    f"ckpt_path = {str(root / 'model')!r}",
+                    f"checkpoint_path = {str(broken_weights)!r}",
+                )
+            )
+
+            with self.assertRaises(ConfigValidationError) as caught:
+                load_and_validate_config(config_path)
+
+        self.assertIn('not a readable safetensors file', str(caught.exception))
+
+    def test_nsync_pairing_is_checked_during_preflight(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             config_path = self._write_valid_config(root)
@@ -192,6 +276,10 @@ nsync_role = 'positive'
                 )
                 + '''\
 
+[adapter]
+type = 'lora'
+rank = 8
+
 [training_methods.nsync]
 enabled = true
 '''
@@ -201,6 +289,112 @@ enabled = true
                 load_and_validate_config(config_path)
 
         self.assertIn('exactly one positive and one negative', str(caught.exception))
+
+    def test_nsync_media_pairing_is_checked_during_preflight(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_path = self._write_valid_config(root)
+            positive_dir = root / 'media'
+            negative_dir = root / 'negative'
+            negative_dir.mkdir()
+            (negative_dir / 'different.png').write_bytes(b'not decoded during preflight')
+            dataset_path = root / 'dataset.toml'
+            dataset_path.write_text(
+                f'''\
+resolutions = [512]
+
+[[directory]]
+path = {str(positive_dir)!r}
+nsync_role = 'positive'
+
+[[directory]]
+path = {str(negative_dir)!r}
+caption_path = {str(positive_dir)!r}
+nsync_role = 'negative'
+'''
+            )
+            model_dir = root / 'model'
+            config_path.write_text(
+                config_path.read_text()
+                .replace("type = 'wan'", "type = 'minimax_h3'")
+                .replace(
+                    f"ckpt_path = {str(model_dir)!r}",
+                    f"diffusion_model = {str(model_dir)!r}\n"
+                    f"vae = {str(model_dir)!r}\n"
+                    f"audio_vae = {str(model_dir)!r}\n"
+                    f"text_encoders = [{{path = {str(model_dir)!r}, type = 'minimax'}}]",
+                )
+                + '''\
+
+[adapter]
+type = 'lora'
+rank = 8
+
+[training_methods.nsync]
+enabled = true
+'''
+            )
+
+            with self.assertRaises(ConfigValidationError) as caught:
+                load_and_validate_config(config_path)
+
+        self.assertIn('missing 1 negative media files', str(caught.exception))
+
+    def test_self_flow_constraints_are_checked_during_preflight(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_path = self._write_valid_config(root)
+            model_dir = root / 'model'
+            config_path.write_text(
+                config_path.read_text()
+                .replace("type = 'wan'", "type = 'minimax_h3'")
+                .replace(
+                    f"ckpt_path = {str(model_dir)!r}",
+                    f"diffusion_model = {str(model_dir)!r}\n"
+                    f"vae = {str(model_dir)!r}\n"
+                    f"audio_vae = {str(model_dir)!r}\n"
+                    f"text_encoders = [{{path = {str(model_dir)!r}, type = 'minimax'}}]",
+                )
+                + '''\
+
+[adapter]
+type = 'lora'
+rank = 8
+
+[training_methods.self_flow]
+enabled = true
+gamma = -1
+ema_decay = 1
+high_noise_range = [1.0, 0.5]
+projection_dim = 0
+student_layer = 8
+teacher_layer = 4
+'''
+            )
+
+            with self.assertRaises(ConfigValidationError) as caught:
+                load_and_validate_config(config_path)
+
+        message = str(caught.exception)
+        self.assertIn('self_flow.gamma', message)
+        self.assertIn('self_flow.ema_decay', message)
+        self.assertIn('self_flow.high_noise_range', message)
+        self.assertIn('self_flow.projection_dim', message)
+        self.assertIn('student_layer must be less than teacher_layer', message)
+
+    def test_resume_target_must_contain_a_deepspeed_checkpoint(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_path = self._write_valid_config(root)
+            output_dir = root / 'output'
+            output_dir.mkdir()
+            (output_dir / '20260814_12-00-00').mkdir()
+
+            with self.assertRaises(ConfigValidationError) as caught:
+                load_and_validate_config(config_path, resume_from_checkpoint=True)
+
+        self.assertIn('missing', str(caught.exception))
+        self.assertIn('latest', str(caught.exception))
 
 
 if __name__ == '__main__':

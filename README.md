@@ -141,7 +141,7 @@ Launch training like this:
 NCCL_P2P_DISABLE="1" NCCL_IB_DISABLE="1" deepspeed --num_gpus=1 train.py --deepspeed --config examples/hunyuan_video.toml
 ```
 
-`train.py` performs a lightweight configuration preflight before importing PyTorch, starting CUDA/DeepSpeed, scanning datasets, or loading models. It reports all of the inexpensive-to-detect configuration and path errors together. You can also run only that check while editing a configuration; it normally completes in a fraction of a second and does not require a GPU:
+`train.py` performs an ordered preflight before doing expensive work: CLI syntax first; then TOML syntax, known keys, types, paths, cross-setting compatibility, dataset structure, required submodules, and Python dependencies; then CUDA/launcher topology; then the potentially slower media/tar enumeration and caption/control/NSYNC matching; and only then the remaining training imports, distributed setup, caching, and model loading. Inexpensive errors within each stage are reported together. You can also run the dependency-light validation while editing a configuration; it performs the dataset checks without importing the training stack or requiring a GPU:
 
 ```bash
 python train.py --validate_only --config path/to/config.toml
