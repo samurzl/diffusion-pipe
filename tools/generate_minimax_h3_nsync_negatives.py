@@ -853,6 +853,9 @@ def make_work_items(
             media.height,
             generation_pixels,
         )
+        # Local H3 inference needs at least five frames. Image positives still
+        # produce one-frame image negatives: normalize_output extracts exactly
+        # one decoded frame and writes it to the same-stem PNG destination.
         generation_length = H3_MIN_LENGTH if media.kind == "image" else max(H3_MIN_LENGTH, media.target_frames)
         if generation_length > H3_MAX_LENGTH:
             raise GenerationError(

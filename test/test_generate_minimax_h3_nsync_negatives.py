@@ -1,16 +1,21 @@
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from tools.generate_minimax_h3_nsync_negatives import (
     GenerationError,
     MediaInfo,
     WorkItem,
+    WorkflowBinding,
     bind_local_h3_workflow,
     find_output_resource,
     fit_generation_dimensions,
     load_api_workflow,
+    make_work_items,
     make_generation_prompt,
+    normalize_output,
     prepare_workflow,
     read_caption,
 )
@@ -42,6 +47,60 @@ def local_h3_workflow():
 
 
 class GenerateMiniMaxH3NSyncNegativesTest(unittest.TestCase):
+    def test_image_positive_produces_one_frame_png_negative(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            positive = root / "positive" / "portrait.jpg"
+            positive.parent.mkdir()
+            positive.touch()
+            positive.with_suffix(".txt").write_text("TOKperson in a studio", encoding="utf-8")
+            negative_dir = root / "negative"
+            negative_dir.mkdir()
+            media = MediaInfo(positive, "image", 1024, 768, 1, 0.0, 1, False)
+            args = SimpleNamespace(
+                ffprobe="ffprobe",
+                caption_index=0,
+                remove_text=["TOKperson"],
+                prompt_template="{caption}",
+                generation_megapixels=0.3,
+                negative_dir=negative_dir,
+                seed=42,
+            )
+            binding = WorkflowBinding("5", "prompt", "5", "14", 736, 416)
+
+            with patch(
+                "tools.generate_minimax_h3_nsync_negatives.probe_media",
+                return_value=media,
+            ):
+                item = make_work_items(args, [positive], None, binding)[0]
+
+            self.assertEqual(item.generation_length, 5)
+            self.assertEqual(item.output, negative_dir / "portrait.png")
+
+            generated = root / "generated.mp4"
+            generated.touch()
+            normalized = MediaInfo(item.output, "image", 1024, 768, 1, 0.0, 1, False)
+
+            def create_temporary_output(command, _generated, _destination):
+                Path(command[-1]).touch()
+
+            with patch(
+                "tools.generate_minimax_h3_nsync_negatives.probe_media",
+                side_effect=[
+                    MediaInfo(generated, "video", 736, 416, 5, 24.0, 5, True),
+                    normalized,
+                ],
+            ), patch(
+                "tools.generate_minimax_h3_nsync_negatives._run_ffmpeg",
+                side_effect=create_temporary_output,
+            ) as run_ffmpeg:
+                normalize_output(generated, item.output, media, "ffmpeg", "ffprobe")
+
+            command = run_ffmpeg.call_args.args[0]
+            frame_option = command.index("-frames:v")
+            self.assertEqual(command[frame_option + 1], "1")
+            self.assertTrue(item.output.is_file())
+
     def test_bundled_api_workflow_is_ready_for_negative_generation(self):
         workflow_path = Path(__file__).resolve().parents[1] / "examples" / "minimax_h3_t2va_api.json"
         workflow = load_api_workflow(workflow_path)

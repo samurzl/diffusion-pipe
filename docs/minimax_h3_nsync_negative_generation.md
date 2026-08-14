@@ -18,7 +18,7 @@ For every supported file directly inside the positive directory, the script:
 6. writes a negative with the same filename stem; and
 7. normalizes the result to the positive's dimensions, 24 fps duration/frame count, media type, and audio presence.
 
-Image positives produce same-stem `.png` negatives. Video positives produce same-stem `.mp4` negatives. Extensions may differ because diffusion-pipe pairs NSYNC media by stem.
+For an image positive, the negative is always a same-stem `.png` containing exactly one frame. H3 itself requires a minimum five-frame generation latent, so the generator decodes that minimum internally and extracts one normalized frame for the final image negative. For a video positive, the negative remains a same-stem `.mp4` and is trimmed or padded to the positive's exact 24 fps frame count. Extensions may differ because diffusion-pipe pairs NSYNC media by stem.
 
 The generated media and training captions serve different purposes:
 

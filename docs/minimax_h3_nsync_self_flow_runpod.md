@@ -421,6 +421,8 @@ test -s "$H3_WORKFLOW_API" \
 
 No manual ComfyUI export is needed. The generator changes the prompt, width, height, length, seed, and filename prefix for every source file while leaving the tested sampling and AV decode graph intact.
 
+Mixed image/video datasets are handled per file. Image positives produce same-stem one-frame `.png` negatives; H3 generates its minimum five-frame latent internally and the utility extracts one frame. Video positives produce `.mp4` negatives normalized to the positive video's dimensions, duration, frame count, and audio presence.
+
 ## 8. Generate the NSYNC negatives automatically
 
 First inspect the generator's options:
