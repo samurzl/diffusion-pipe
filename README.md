@@ -122,12 +122,11 @@ Start with a dry run:
 python tools/generate_minimax_h3_nsync_negatives.py \
   /path/to/target_positive_media \
   /path/to/generated_negative_media \
-  --workflow /path/to/minimax_h3_t2va_api.json \
   --remove-text 'your trigger or target style' \
   --dry-run
 ```
 
-Remove `--dry-run` to generate. The ComfyUI workflow must be exported in API format, use the local `MiniMaxH3ImageToVideo` node without first/last-frame or reference conditioning, and save one decoded result through `SaveVideo`. See the [complete local ComfyUI negative-generation guide](./docs/minimax_h3_nsync_negative_generation.md), the [MiniMax H3 training notes](./docs/minimax_h3_notes.md), and the [paired dataset example](./examples/minimax_h3_nsync_self_flow_dataset.toml).
+Remove `--dry-run` to generate. The ready repository workflow is used automatically; no bootstrap-generated workflow file is required. Pass the manual `--comfy-root`, `--diffusion-model`, `--text-encoder`, `--video-vae`, `--audio-vae`, and `--turbo-lora` overrides when your ComfyUI filenames differ. A custom workflow must be exported in API format, use the local `MiniMaxH3ImageToVideo` node without first/last-frame or reference conditioning, and save one decoded result through `SaveVideo`. See the [complete local ComfyUI negative-generation guide](./docs/minimax_h3_nsync_negative_generation.md), the [MiniMax H3 training notes](./docs/minimax_h3_notes.md), and the [paired dataset example](./examples/minimax_h3_nsync_self_flow_dataset.toml).
 
 ## Supported models
 See the [supported models doc](./docs/supported_models.md) for more information on how to configure each model, the options it supports, and the format of the saved LoRAs.

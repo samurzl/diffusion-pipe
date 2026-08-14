@@ -53,6 +53,40 @@ export H3_WORKFLOW_API=/workspace/workflows/minimax_h3_t2va_api.json
 
 The RunPod setup script creates that runtime copy with the correct ComfyUI loader filenames. If using the standard model filenames without the bootstrap, use `examples/minimax_h3_t2va_api.json` directly. The bundled defaults are 736×416 (approximately 0.3 MP), 56 frames on H3's `17n+5` grid (approximately 2.33 seconds at 24 fps), Euler, six sampling steps, LoRA strength 1.0, and LightX2V's required video/audio sigma shifts of 6/3. The generator replaces the canvas and frame request per positive so paired negatives still match their sources. Continue to [Prepare the positive directory](#prepare-the-positive-directory) unless you need to customize sampling.
 
+### Run directly without the bootstrap
+
+The generator uses the tracked [`examples/minimax_h3_t2va_api.json`](../examples/minimax_h3_t2va_api.json) automatically when `--workflow` is omitted. If your ComfyUI model files use the workflow's standard filenames, you do not need any setup-generated environment variables or model arguments:
+
+```bash
+cd /workspace/diffusion-pipe
+python tools/generate_minimax_h3_nsync_negatives.py \
+  /workspace/data/minimax-h3/positive \
+  /workspace/data/minimax-h3/negative \
+  --comfy-url http://127.0.0.1:8188 \
+  --remove-text 'TOKperson' \
+  --generation-megapixels 0.3
+```
+
+When your files have different names, pass either their loader names exactly as ComfyUI displays them, or their absolute paths together with `--comfy-root`. This complete example does not run or depend on the bootstrap:
+
+```bash
+cd /workspace/diffusion-pipe
+python tools/generate_minimax_h3_nsync_negatives.py \
+  /workspace/data/minimax-h3/positive \
+  /workspace/data/minimax-h3/negative \
+  --comfy-url http://127.0.0.1:8188 \
+  --comfy-root /workspace/ComfyUI \
+  --diffusion-model /workspace/ComfyUI/models/diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors \
+  --text-encoder /workspace/ComfyUI/models/text_encoders/qwen3vl_32b_minimax_h3_int8_convrot.safetensors \
+  --video-vae /workspace/ComfyUI/models/vae/minimax_h3_video_vae_fp16.safetensors \
+  --audio-vae /workspace/ComfyUI/models/vae/minimax_h3_audio_vae_fp32.safetensors \
+  --turbo-lora /workspace/ComfyUI/models/loras/minimax_h3_fl2v_turbo_4step_v1.0_768p_comfyui_bf16.safetensors \
+  --remove-text 'TOKperson' \
+  --generation-megapixels 0.3
+```
+
+These overrides patch only the in-memory copy sent to ComfyUI; they do not edit your ComfyUI installation or the tracked JSON. For models exposed through `extra_model_paths.yaml`, pass the relative loader name shown in ComfyUI instead of an absolute path. Use `--workflow /path/to/custom_api.json` only when substituting another graph.
+
 To build a custom workflow, create and successfully run the generation graph once in ComfyUI before exporting it:
 
 1. Load the local MiniMax H3 diffusion model, video VAE, audio VAE, and MiniMax text encoder.

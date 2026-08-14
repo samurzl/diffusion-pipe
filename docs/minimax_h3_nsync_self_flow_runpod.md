@@ -423,6 +423,8 @@ No manual ComfyUI export is needed. The generator changes the prompt, width, hei
 
 Mixed image/video datasets are handled per file. Image positives produce same-stem one-frame `.png` negatives; H3 generates its minimum five-frame latent internally and the utility extracts one frame. Video positives produce `.mp4` negatives normalized to the positive video's dimensions, duration, frame count, and audio presence.
 
+If you skipped the bootstrap, omit `--workflow` to use the tracked ready graph and pass the five model files through the generator's manual loader arguments. The [direct-without-bootstrap command](minimax_h3_nsync_negative_generation.md#run-directly-without-the-bootstrap) shows both the standard-filename and fully explicit forms.
+
 ## 8. Generate the NSYNC negatives automatically
 
 First inspect the generator's options:

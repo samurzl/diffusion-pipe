@@ -5,11 +5,14 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from tools.generate_minimax_h3_nsync_negatives import (
+    DEFAULT_H3_WORKFLOW,
     GenerationError,
     MediaInfo,
     WorkItem,
     WorkflowBinding,
+    apply_workflow_model_overrides,
     bind_local_h3_workflow,
+    build_parser,
     find_output_resource,
     fit_generation_dimensions,
     load_api_workflow,
@@ -47,6 +50,48 @@ def local_h3_workflow():
 
 
 class GenerateMiniMaxH3NSyncNegativesTest(unittest.TestCase):
+    def test_ready_workflow_is_default_and_accepts_manual_model_paths(self):
+        parsed = build_parser().parse_args(
+            ["positive", "negative", "--remove-text", "TOKperson"]
+        )
+        self.assertEqual(parsed.workflow, DEFAULT_H3_WORKFLOW)
+        self.assertTrue(DEFAULT_H3_WORKFLOW.is_file())
+
+        with tempfile.TemporaryDirectory() as directory:
+            comfy_root = Path(directory) / "ComfyUI"
+            models = comfy_root / "models"
+            model_paths = {
+                "diffusion_model": models / "diffusion_models" / "quantized" / "h3.safetensors",
+                "text_encoder": models / "text_encoders" / "h3_text.safetensors",
+                "video_vae": models / "vae" / "h3_video.safetensors",
+                "audio_vae": models / "vae" / "h3_audio.safetensors",
+                "turbo_lora": models / "loras" / "turbo" / "h3_turbo.safetensors",
+            }
+            for model_path in model_paths.values():
+                model_path.parent.mkdir(parents=True, exist_ok=True)
+                model_path.touch()
+            workflow = load_api_workflow(DEFAULT_H3_WORKFLOW)
+
+            apply_workflow_model_overrides(
+                workflow,
+                comfy_root=comfy_root,
+                **{name: str(path) for name, path in model_paths.items()},
+            )
+
+            self.assertEqual(workflow["1"]["inputs"]["unet_name"], "quantized/h3.safetensors")
+            self.assertEqual(workflow["2"]["inputs"]["clip_name"], "h3_text.safetensors")
+            self.assertEqual(workflow["3"]["inputs"]["vae_name"], "h3_video.safetensors")
+            self.assertEqual(workflow["4"]["inputs"]["vae_name"], "h3_audio.safetensors")
+            self.assertEqual(workflow["15"]["inputs"]["lora_name"], "turbo/h3_turbo.safetensors")
+
+    def test_absolute_model_override_requires_comfy_root(self):
+        workflow = load_api_workflow(DEFAULT_H3_WORKFLOW)
+        with self.assertRaisesRegex(GenerationError, "--comfy-root is required"):
+            apply_workflow_model_overrides(
+                workflow,
+                diffusion_model="/workspace/ComfyUI/models/diffusion_models/h3.safetensors",
+            )
+
     def test_image_positive_produces_one_frame_png_negative(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

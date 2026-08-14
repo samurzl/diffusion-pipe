@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Generate MiniMax H3 N-Sync negatives through a local ComfyUI workflow.
 
-The input workflow must be exported from ComfyUI in API format and use the
-local MiniMax H3 nodes. Hosted/partner MiniMax API nodes are rejected. For each
-positive media file, this script:
+The repository's ready LightX2V Turbo API workflow is used by default. A custom
+workflow must be exported from ComfyUI in API format and use the local MiniMax
+H3 nodes. Hosted/partner MiniMax API nodes are rejected. For each positive
+media file, this script:
 
 1. reads the matching caption from ``<stem>.txt`` or ``captions.json``;
 2. removes user-supplied target/style text from the generation prompt;
@@ -47,6 +48,17 @@ H3_FPS = 24.0
 H3_DIMENSION_MULTIPLE = 32
 H3_MIN_LENGTH = 5
 H3_MAX_LENGTH = 3600
+DEFAULT_H3_WORKFLOW = (
+    Path(__file__).resolve().parents[1] / "examples" / "minimax_h3_t2va_api.json"
+)
+
+BUNDLED_MODEL_INPUTS = {
+    "diffusion_model": ("1", "UNETLoader", "unet_name", "diffusion_models"),
+    "text_encoder": ("2", "CLIPLoader", "clip_name", "text_encoders"),
+    "video_vae": ("3", "VAELoader", "vae_name", "vae"),
+    "audio_vae": ("4", "VAELoader", "vae_name", "vae"),
+    "turbo_lora": ("15", "LoraLoaderModelOnly", "lora_name", "loras"),
+}
 
 IMAGE_EXTENSIONS = {
     ".bmp",
@@ -351,6 +363,77 @@ def load_api_workflow(path: Path) -> dict[str, dict[str, Any]]:
         if not isinstance(node.get("inputs"), dict):
             raise GenerationError(f"Workflow node {node_id!r} has no inputs object")
     return workflow
+
+
+def _comfy_loader_name(
+    value: str,
+    comfy_root: Path | None,
+    category: str,
+    label: str,
+) -> str:
+    value = value.strip()
+    if not value:
+        raise GenerationError(f"--{label.replace('_', '-')} cannot be empty")
+    path = Path(value).expanduser()
+    if not path.is_absolute():
+        if ".." in path.parts:
+            raise GenerationError(
+                f"--{label.replace('_', '-')} must be a ComfyUI loader name without '..', "
+                "or an absolute path used with --comfy-root"
+            )
+        return path.as_posix()
+
+    if comfy_root is None:
+        raise GenerationError(
+            f"--{label.replace('_', '-')} is an absolute path, so --comfy-root is required"
+        )
+    if not path.is_file():
+        raise GenerationError(f"{label.replace('_', ' ').title()} does not exist: {path}")
+    category_root = comfy_root / "models" / category
+    try:
+        relative = path.absolute().relative_to(category_root.absolute())
+    except ValueError as error:
+        raise GenerationError(
+            f"{label.replace('_', ' ').title()} must be inside {category_root}, or be passed "
+            "as the loader name shown in ComfyUI when extra_model_paths.yaml provides it"
+        ) from error
+    return relative.as_posix()
+
+
+def apply_workflow_model_overrides(
+    workflow: dict[str, dict[str, Any]],
+    *,
+    comfy_root: Path | None = None,
+    diffusion_model: str | None = None,
+    text_encoder: str | None = None,
+    video_vae: str | None = None,
+    audio_vae: str | None = None,
+    turbo_lora: str | None = None,
+) -> None:
+    """Patch the bundled workflow's ComfyUI loader names in memory."""
+    overrides = {
+        "diffusion_model": diffusion_model,
+        "text_encoder": text_encoder,
+        "video_vae": video_vae,
+        "audio_vae": audio_vae,
+        "turbo_lora": turbo_lora,
+    }
+    for label, value in overrides.items():
+        if value is None:
+            continue
+        node_id, class_type, input_name, category = BUNDLED_MODEL_INPUTS[label]
+        node = workflow.get(node_id)
+        if node is None or node.get("class_type") != class_type:
+            raise GenerationError(
+                f"--{label.replace('_', '-')} expects bundled workflow node {node_id} "
+                f"to be {class_type}; omit the override or use the bundled workflow"
+            )
+        node["inputs"][input_name] = _comfy_loader_name(
+            value,
+            comfy_root,
+            category,
+            label,
+        )
 
 
 def _node_title(node: dict[str, Any]) -> str:
@@ -763,8 +846,50 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("positive_dir", type=Path, help="Directory containing positive media and captions")
     parser.add_argument("negative_dir", type=Path, help="Directory in which paired negatives are written")
-    parser.add_argument("--workflow", required=True, type=Path, help="Local H3 workflow exported in API format")
+    parser.add_argument(
+        "--workflow",
+        type=Path,
+        default=DEFAULT_H3_WORKFLOW,
+        help="Local H3 API workflow; defaults to the repository's ready LightX2V Turbo workflow",
+    )
     parser.add_argument("--comfy-url", default="http://127.0.0.1:8188", help="Local ComfyUI server URL")
+    parser.add_argument(
+        "--comfy-root",
+        type=Path,
+        help=(
+            "Existing ComfyUI root; required when a model override is an absolute path, "
+            "but not when overrides use loader names shown in ComfyUI"
+        ),
+    )
+    model_group = parser.add_argument_group(
+        "bundled workflow model overrides",
+        "Pass a ComfyUI loader name, or an absolute path inside --comfy-root/models/<category>.",
+    )
+    model_group.add_argument(
+        "--diffusion-model",
+        metavar="NAME_OR_PATH",
+        help="MiniMax H3 diffusion model for the bundled UNETLoader",
+    )
+    model_group.add_argument(
+        "--text-encoder",
+        metavar="NAME_OR_PATH",
+        help="MiniMax H3 text encoder for the bundled CLIPLoader",
+    )
+    model_group.add_argument(
+        "--video-vae",
+        metavar="NAME_OR_PATH",
+        help="MiniMax H3 video VAE for the bundled VAELoader",
+    )
+    model_group.add_argument(
+        "--audio-vae",
+        metavar="NAME_OR_PATH",
+        help="MiniMax H3 audio VAE for the bundled VAELoader",
+    )
+    model_group.add_argument(
+        "--turbo-lora",
+        metavar="NAME_OR_PATH",
+        help="LightX2V MiniMax H3 Turbo LoRA for the bundled LoraLoaderModelOnly",
+    )
     parser.add_argument(
         "--remove-text",
         action="append",
@@ -813,6 +938,10 @@ def validate_args(args: argparse.Namespace) -> None:
         raise GenerationError("Positive and negative directories must be different")
     if not args.workflow.is_file():
         raise GenerationError(f"Workflow does not exist: {args.workflow}")
+    if args.comfy_root is not None:
+        args.comfy_root = args.comfy_root.expanduser().absolute()
+        if not (args.comfy_root / "models").is_dir():
+            raise GenerationError(f"ComfyUI root has no models directory: {args.comfy_root}")
     args.remove_text = [fragment.strip() for fragment in args.remove_text if fragment.strip()]
     if not args.remove_text and not args.allow_unchanged_prompt:
         raise GenerationError(
@@ -882,6 +1011,15 @@ def make_work_items(
 def run(args: argparse.Namespace) -> int:
     validate_args(args)
     workflow = load_api_workflow(args.workflow)
+    apply_workflow_model_overrides(
+        workflow,
+        comfy_root=args.comfy_root,
+        diffusion_model=args.diffusion_model,
+        text_encoder=args.text_encoder,
+        video_vae=args.video_vae,
+        audio_vae=args.audio_vae,
+        turbo_lora=args.turbo_lora,
+    )
     binding = bind_local_h3_workflow(
         workflow,
         conditioning_node=args.conditioning_node,
