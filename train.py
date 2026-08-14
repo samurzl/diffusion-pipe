@@ -4,38 +4,95 @@ import sys
 import json
 from pathlib import Path
 
-from utils.config_validation import ConfigValidationError, load_and_validate_config
+from utils.config_validation import (
+    ConfigValidationError,
+    load_and_validate_config,
+    validate_preflight_dependencies,
+)
 
 
 # Run a cheap, dependency-light preflight before importing torch, DeepSpeed,
 # Hugging Face, or ComfyUI. Model and dataset initialization can take many
 # minutes, so discovering a TOML typo after those imports is needlessly costly.
-_preflight_parser = argparse.ArgumentParser(add_help=False)
-_preflight_parser.add_argument('--config')
-_preflight_parser.add_argument('--validate_only', action='store_true')
-_preflight_parser.add_argument('--i_know_what_i_am_doing', action='store_true')
-_preflight_parser.add_argument('--resume_from_checkpoint', nargs='?', const=True, default=None)
-_preflight_args, _ = _preflight_parser.parse_known_args()
+parser = argparse.ArgumentParser()
+parser.add_argument('--config', required=True, help='Path to TOML configuration file.')
+parser.add_argument('--local_rank', type=int, default=-1,
+                    help='local rank passed from distributed launcher')
+parser.add_argument('--resume_from_checkpoint', nargs='?', const=True, default=None,
+                    help='resume training from checkpoint. If no value is provided, resume from the most recent checkpoint. If a folder name is provided, resume from that specific folder.')
+parser.add_argument('--reset_dataloader', action='store_true', help='Start dataloader from scratch when resuming from checkpoint, i.e. only load the optimizer states.')
+parser.add_argument('--reset_optimizer', action='store_true')
+parser.add_argument('--reset_optimizer_params', action='store_true')
+parser.add_argument('--regenerate_cache', action='store_true', default=None, help='Force regenerate cache.')
+mode_group = parser.add_mutually_exclusive_group()
+mode_group.add_argument('--cache_only', action='store_true', help='Cache model inputs then exit.')
+mode_group.add_argument('--dump_dataset', type=Path, default=None, help='Decode cached latents and dump the dataset to this directory.')
+mode_group.add_argument('--test_sample', action='store_true', help='Generate and write an image to example.png and then quit.')
+parser.add_argument('--trust_cache', action='store_true', help='Load from metadata cache files if they exist, without checking if any fingerprints have changed. Can make loading much faster for large datasets.')
+parser.add_argument('--i_know_what_i_am_doing', action='store_true', help="Skip certain checks and overrides. You may end up using settings that won't work.")
+parser.add_argument('--master_port', type=int, default=29500, help='Master port for distributed training')
+parser.add_argument('--validate_only', action='store_true', help='Validate config, dependencies, and dataset paths without importing training dependencies, initializing CUDA, or loading models.')
+
+# These are the arguments currently added by deepspeed.add_config_arguments().
+# Defining them here lets argparse reject CLI typos before importing DeepSpeed.
+parser.add_argument('--deepspeed', action='store_true')
+parser.add_argument('--deepspeed_config', default=None)
+parser.add_argument('--deepscale', action='store_true')
+parser.add_argument('--deepscale_config', default=None)
+parser.add_argument('--deepspeed_mpi', action='store_true')
+args = parser.parse_args()
 
 _preflight_config = None
 _preflight_dataset_configs = {}
-if _preflight_args.config:
-    try:
-        _preflight_config, _preflight_dataset_configs = load_and_validate_config(
-            _preflight_args.config,
-            skip_dataset_validation=_preflight_args.i_know_what_i_am_doing,
-            world_size=int(os.environ['WORLD_SIZE']) if 'WORLD_SIZE' in os.environ else None,
-            resume_from_checkpoint=_preflight_args.resume_from_checkpoint,
-        )
-    except ConfigValidationError as exc:
-        raise SystemExit(f'\n{exc}') from None
-elif '--help' not in sys.argv and '-h' not in sys.argv:
-    raise SystemExit('--config is required')
+try:
+    environment_errors = []
+    world_size = None
+    for name in ('WORLD_SIZE', 'RANK', 'LOCAL_RANK', 'LOCAL_WORLD_SIZE'):
+        if name not in os.environ:
+            continue
+        try:
+            value = int(os.environ[name])
+        except ValueError:
+            environment_errors.append(f'environment variable {name} must be an integer, got {os.environ[name]!r}')
+            continue
+        if name in ('WORLD_SIZE', 'LOCAL_WORLD_SIZE') and value <= 0:
+            environment_errors.append(f'environment variable {name} must be positive, got {value}')
+        elif name in ('RANK', 'LOCAL_RANK') and value < 0:
+            environment_errors.append(f'environment variable {name} must be non-negative, got {value}')
+        if name == 'WORLD_SIZE':
+            world_size = value
+    if not 1 <= args.master_port <= 65535:
+        environment_errors.append(f'--master_port must be in [1, 65535], got {args.master_port}')
+    if environment_errors:
+        raise ConfigValidationError(environment_errors)
 
-if _preflight_args.validate_only:
-    if not _preflight_args.config:
-        raise SystemExit('--validate_only requires --config')
-    print(f'Configuration is valid: {_preflight_args.config}')
+    _preflight_config, _preflight_dataset_configs = load_and_validate_config(
+        args.config,
+        skip_dataset_validation=args.i_know_what_i_am_doing,
+        world_size=world_size,
+        resume_from_checkpoint=args.resume_from_checkpoint,
+    )
+    if args.dump_dataset and _preflight_config.get('model', {}).get('type') != 'flux':
+        raise ConfigValidationError(['--dump_dataset is currently implemented only for model.type="flux"'])
+    if (
+        (args.reset_dataloader or args.reset_optimizer or args.reset_optimizer_params)
+        and args.resume_from_checkpoint is None
+        and not _preflight_config.get('resume_from_checkpoint', False)
+    ):
+        raise ConfigValidationError([
+            '--reset_dataloader, --reset_optimizer, and --reset_optimizer_params require resuming from a checkpoint'
+        ])
+    validate_preflight_dependencies(
+        _preflight_config,
+        repository_root=Path(__file__).resolve().parent,
+        include_training_dependencies=not args.validate_only,
+        cache_only=args.cache_only,
+    )
+except ConfigValidationError as exc:
+    raise SystemExit(f'\n{exc}') from None
+
+if args.validate_only:
+    print(f'Configuration is valid: {args.config}')
     raise SystemExit(0)
 
 
@@ -73,26 +130,6 @@ mp.current_process().authkey = b'afsaskgfdjh4'
 wandb_enable = False
 
 TIMESTEP_QUANTILES_FOR_EVAL = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
-
-parser = argparse.ArgumentParser()
-parser.add_argument('--config', help='Path to TOML configuration file.')
-parser.add_argument('--local_rank', type=int, default=-1,
-                    help='local rank passed from distributed launcher')
-parser.add_argument('--resume_from_checkpoint', nargs='?', const=True, default=None,
-                    help='resume training from checkpoint. If no value is provided, resume from the most recent checkpoint. If a folder name is provided, resume from that specific folder.')
-parser.add_argument('--reset_dataloader', action='store_true', help='Start dataloader from scratch when resuming from checkpoint, i.e. only load the optimizer states.')
-parser.add_argument('--reset_optimizer', action='store_true')
-parser.add_argument('--reset_optimizer_params', action='store_true')
-parser.add_argument('--regenerate_cache', action='store_true', help='Force regenerate cache.')
-parser.add_argument('--cache_only', action='store_true', help='Cache model inputs then exit.')
-parser.add_argument('--trust_cache', action='store_true', help='Load from metadata cache files if they exist, without checking if any fingerprints have changed. Can make loading much faster for large datasets.')
-parser.add_argument('--i_know_what_i_am_doing', action='store_true', help="Skip certain checks and overrides. You may end up using settings that won't work.")
-parser.add_argument('--master_port', type=int, default=29500, help='Master port for distributed training')
-parser.add_argument('--dump_dataset', type=Path, default=None, help='Decode cached latents and dump the dataset to this directory.')
-parser.add_argument('--test_sample', action='store_true', help='Generate and write an image to example.png and then quit.')
-parser.add_argument('--validate_only', action='store_true', help='Validate config and dataset paths without importing training dependencies, initializing CUDA, or loading models.')
-parser = deepspeed.add_config_arguments(parser)
-args = parser.parse_args()
 
 
 class DummyOptimizer(torch.optim.Optimizer):
@@ -231,8 +268,81 @@ def validate_optimizer_availability(config):
         ) from None
 
 
+MODEL_PIPELINES = {
+    'anima': ('models.cosmos_predict2', 'CosmosPredict2Pipeline'),
+    'auraflow': ('models.auraflow', 'AuraFlowPipeline'),
+    'chroma': ('models.chroma', 'ChromaPipeline'),
+    'cosmos': ('models.cosmos', 'CosmosPipeline'),
+    'cosmos_predict2': ('models.cosmos_predict2', 'CosmosPredict2Pipeline'),
+    'ernie_image': ('models.ernie_image', 'ErnieImagePipeline'),
+    'flux': ('models.flux', 'FluxPipeline'),
+    'flux2': ('models.flux2', 'Flux2Pipeline'),
+    'hidream': ('models.hidream', 'HiDreamPipeline'),
+    'hunyuan-video': ('models.hunyuan_video', 'HunyuanVideoPipeline'),
+    'hunyuan_image': ('models.hunyuan_image', 'HunyuanImagePipeline'),
+    'hunyuan_video_15': ('models.hunyuan_video_15', 'HunyuanVideo15Pipeline'),
+    'ideogram4': ('models.ideogram4', 'Ideogram4Pipeline'),
+    'krea2': ('models.krea2', 'Krea2Pipeline'),
+    'ltx-video': ('models.ltx_video', 'LTXVideoPipeline'),
+    'ltx2': ('models.ltx2', 'LTX2Pipeline'),
+    'lumina_2': ('models.lumina_2', 'Lumina2Pipeline'),
+    'minimax_h3': ('models.minimax_h3', 'MinimaxH3Pipeline'),
+    'omnigen2': ('models.omnigen2', 'OmniGen2Pipeline'),
+    'qwen_image': ('models.qwen_image', 'QwenImagePipeline'),
+    'sd3': ('models.sd3', 'SD3Pipeline'),
+    'sdxl': ('models.sdxl', 'SDXLPipeline'),
+    'wan': ('models.wan.wan', 'WanPipeline'),
+    'z_image': ('models.z_image', 'ZImagePipeline'),
+}
+
+
+def resolve_model_pipeline(model_type):
+    """Import the selected implementation before distributed/CUDA initialization."""
+    module_name, class_name = MODEL_PIPELINES[model_type]
+    module = importlib.import_module(module_name)
+    return getattr(module, class_name)
+
+
+def validate_runtime_environment(args):
+    """Fail before distributed setup if the launcher or CUDA topology is unusable."""
+    errors = []
+    world_size = int(os.getenv('WORLD_SIZE', '1'))
+    rank = int(os.getenv('RANK', '0'))
+    if not 0 <= rank < world_size:
+        errors.append(f'RANK ({rank}) must be in [0, WORLD_SIZE={world_size})')
+
+    environment_local_rank = int(os.getenv('LOCAL_RANK', '-1'))
+    local_rank = args.local_rank if args.local_rank >= 0 else environment_local_rank
+    if local_rank < 0 and world_size == 1:
+        local_rank = 0
+    if local_rank < 0:
+        errors.append('local rank is missing; launch training with DeepSpeed or set LOCAL_RANK')
+
+    if not torch.cuda.is_available():
+        errors.append('CUDA is not available to PyTorch')
+    else:
+        device_count = torch.cuda.device_count()
+        if local_rank >= device_count:
+            errors.append(
+                f'LOCAL_RANK ({local_rank}) has no CUDA device; PyTorch sees {device_count} device(s)'
+            )
+        if 'LOCAL_WORLD_SIZE' in os.environ:
+            local_world_size = int(os.environ['LOCAL_WORLD_SIZE'])
+            if local_world_size > device_count:
+                errors.append(
+                    f'LOCAL_WORLD_SIZE ({local_world_size}) exceeds the {device_count} CUDA device(s) '
+                    'visible to PyTorch'
+                )
+
+    if errors:
+        raise ConfigValidationError(errors)
+    args.local_rank = local_rank
+    return world_size, rank, local_rank
+
+
 def get_most_recent_run_dir(output_dir):
-    return list(sorted(glob.glob(os.path.join(output_dir, '*'))))[-1]
+    run_directories = [path for path in glob.glob(os.path.join(output_dir, '*')) if os.path.isdir(path)]
+    return sorted(run_directories)[-1]
 
 
 def print_model_info(model):
@@ -362,11 +472,6 @@ def _get_automagic_lrs(optimizer):
 
 
 if __name__ == '__main__':
-    # With multiple GPUs / large batch sizes, the dataloader can trigger "too many open files" errors unless we do this.
-    torch.multiprocessing.set_sharing_strategy('file_system')
-    deepspeed.utils.set_log_level_from_string('info')
-    apply_patches()
-
     # Inline TOML tables are not pickleable, which messes up the multiprocessing
     # dataset code. The JSON round trip also gives this process a private copy of
     # the already-preflighted config.
@@ -375,6 +480,14 @@ if __name__ == '__main__':
     set_config_defaults(config)
     if not args.cache_only:
         validate_optimizer_availability(config)
+    model_pipeline_class = resolve_model_pipeline(config['model']['type'])
+    validate_runtime_environment(args)
+
+    # With multiple GPUs / large batch sizes, the dataloader can trigger "too many open files" errors unless we do this.
+    torch.multiprocessing.set_sharing_strategy('file_system')
+    deepspeed.utils.set_log_level_from_string('info')
+    apply_patches()
+
     common.AUTOCAST_DTYPE = config['model']['dtype']
     dataset_util.UNCOND_FRACTION = config.get('uncond_fraction', 0.0)
     if map_num_proc := config.get('map_num_proc', None):
@@ -399,78 +512,7 @@ if __name__ == '__main__':
     )
 
     model_type = config['model']['type']
-
-    if model_type == 'flux':
-        from models import flux
-        model = flux.FluxPipeline(config)
-    elif model_type == 'ltx-video':
-        from models import ltx_video
-        model = ltx_video.LTXVideoPipeline(config)
-    elif model_type == 'hunyuan-video':
-        from models import hunyuan_video
-        model = hunyuan_video.HunyuanVideoPipeline(config)
-    elif model_type == 'sdxl':
-        from models import sdxl
-        model = sdxl.SDXLPipeline(config)
-    elif model_type == 'cosmos':
-        from models import cosmos
-        model = cosmos.CosmosPipeline(config)
-    elif model_type == 'lumina_2':
-        from models import lumina_2
-        model = lumina_2.Lumina2Pipeline(config)
-    elif model_type == 'wan':
-        from models.wan import wan
-        model = wan.WanPipeline(config)
-    elif model_type == 'chroma':
-        from models import chroma
-        model = chroma.ChromaPipeline(config)
-    elif model_type == 'hidream':
-        from models import hidream
-        model = hidream.HiDreamPipeline(config)
-    elif model_type == 'sd3':
-        from models import sd3
-        model = sd3.SD3Pipeline(config)
-    elif model_type == 'cosmos_predict2' or model_type == 'anima':
-        from models import cosmos_predict2
-        model = cosmos_predict2.CosmosPredict2Pipeline(config)
-    elif model_type == 'omnigen2':
-        from models import omnigen2
-        model = omnigen2.OmniGen2Pipeline(config)
-    elif model_type == 'qwen_image':
-        from models import qwen_image
-        model = qwen_image.QwenImagePipeline(config)
-    elif model_type == 'hunyuan_image':
-        from models import hunyuan_image
-        model = hunyuan_image.HunyuanImagePipeline(config)
-    elif model_type == 'auraflow':
-        from models import auraflow
-        model = auraflow.AuraFlowPipeline(config)
-    elif model_type == 'z_image':
-        from models import z_image
-        model = z_image.ZImagePipeline(config)
-    elif model_type == 'hunyuan_video_15':
-        from models import hunyuan_video_15
-        model = hunyuan_video_15.HunyuanVideo15Pipeline(config)
-    elif model_type == 'flux2':
-        from models import flux2
-        model = flux2.Flux2Pipeline(config)
-    elif model_type == 'ernie_image':
-        from models import ernie_image
-        model = ernie_image.ErnieImagePipeline(config)
-    elif model_type == 'ltx2':
-        from models import ltx2
-        model = ltx2.LTX2Pipeline(config)
-    elif model_type == 'ideogram4':
-        from models import ideogram4
-        model = ideogram4.Ideogram4Pipeline(config)
-    elif model_type == 'krea2':
-        from models import krea2
-        model = krea2.Krea2Pipeline(config)
-    elif model_type == 'minimax_h3':
-        from models import minimax_h3
-        model = minimax_h3.MinimaxH3Pipeline(config)
-    else:
-        raise NotImplementedError(f'Model type {model_type} is not implemented')
+    model = model_pipeline_class(config)
 
     # import sys, PIL
     # test_image = sys.argv[1]
