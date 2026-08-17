@@ -44,6 +44,12 @@ Videos without an audio track are supported. They still receive normal text/vide
 
 Last-frame and general reference-to-video training are not implemented.
 
+## Small unbucketed datasets
+
+When a small dataset cannot populate useful aspect-ratio and frame buckets, use [`minimax_h3_unbucketed_dataset.toml`](../examples/minimax_h3_unbucketed_dataset.toml). Set `unbucketed = true` and exactly one `resolutions` entry at the dataset root, then remove the aspect-ratio, frame-bucket, and explicit size-bucket settings. Each sample is scaled to approximately `resolution²` pixels while retaining its native aspect ratio and usable frame length. Samples are shuffled and trained one at a time, so a sparse shape cannot cause that sample to be dropped. H3's required alignment still applies: spatial dimensions are rounded to the nearest multiple of 32 and frame count is rounded down to a multiple of 17. Videos shorter than 17 frames after conversion to H3's 24 fps are skipped rather than being treated as still images.
+
+The physical video and image microbatch sizes must both be `1`; the same applies to eval microbatch sizes when an eval dataset is unbucketed. `gradient_accumulation_steps` can still be greater than one because each sample is prepared independently before accumulation. The only data omitted is the final incomplete accumulated batch across all data-parallel ranks. Increase `num_repeats` if the complete dataset is smaller than that logical batch. NSYNC remains bucket-based and cannot be combined with this mode.
+
 ## NSYNC LoRA training
 
 The implementation follows the update in the [NSYNC paper](https://arxiv.org/abs/2511.01517) rather than the typo in one path of its released training code. For every logical microbatch it computes the LoRA gradients for a positive batch, its caption-matched generated-negative batch, and an independently sampled positive anchor batch, then applies

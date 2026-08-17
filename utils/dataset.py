@@ -202,10 +202,14 @@ def _cache_text_embeddings(metadata_dataset, map_fn, i, cache_dir, regenerate_ca
     return TextEmbeddingDataset(te_dataset, flattened_captions)
 
 
-# The smallest unit of a dataset. Represents a single size bucket from a single folder of images
-# and captions on disk. Not batched; returns individual items.
+# The smallest unit of a dataset. Represents a single size bucket (or one
+# unbucketed directory) of images and captions on disk. Not batched; returns
+# individual items.
 class SizeBucketDataset:
     def __init__(self, metadata_dataset, directory_config, size_bucket, cache_base, directory_dataset):
+        # grouping_keys.json loads tuples back as lists. Keep regular size
+        # buckets hashable for cross-directory grouping.
+        size_bucket = tuple(size_bucket) if size_bucket is not None else None
         # Shuffle deterministically based on size bucket, so that two resolutions of the same aspect ratio get different
         # orders, which mixes data better when training on multiple resolutions at once.
         seed = seed_from_hash(size_bucket)
@@ -214,10 +218,14 @@ class SizeBucketDataset:
         self.directory_config = directory_config
         self.size_bucket = size_bucket
         self.path = Path(self.directory_config['path'])
-        self.cache_dir = cache_base / f'cache_{bucket_suffix(size_bucket)}'
+        self.cache_dir = (
+            cache_base / 'unbucketed_samples'
+            if size_bucket is None
+            else cache_base / f'cache_{bucket_suffix(size_bucket)}'
+        )
         self.captions_dict = directory_dataset.captions_dict  # optional
 
-        if len(size_bucket) == 4:
+        if size_bucket is not None and len(size_bucket) == 4:
             # rename old folder name to the new one for convenience
             old_cache_dir = cache_base / f'cache_{bucket_suffix(size_bucket[1:])}'
             if old_cache_dir.exists() and not self.cache_dir.exists():
@@ -233,6 +241,10 @@ class SizeBucketDataset:
 
     def cache_latents(self, map_fn, regenerate_cache=False, trust_cache=False, caching_batch_size=1):
         print(f'caching latents: {self.size_bucket}')
+        if self.size_bucket is None:
+            # Native samples can have unrelated tensor shapes, so they cannot
+            # be stacked for one VAE call during caching.
+            caching_batch_size = 1
         self.latent_dataset = _map_and_cache(
             self.metadata_dataset,
             map_fn,
@@ -414,6 +426,50 @@ class ConcatenatedBatchedDataset:
         self.iteration_order = self.iteration_order[:new_length]
         if new_length == 0 and is_main_process():
             logger.warning(f"size bucket {self.datasets[0].size_bucket} is being completely dropped because it doesn't have enough images")
+
+
+class UnbucketedBatchedDataset:
+    """Iterate native-aspect samples one at a time across all directories.
+
+    Training does not group samples by shape: each data-parallel rank receives
+    one independently shaped sample at a time.
+    """
+
+    def __init__(self, datasets):
+        self.datasets = datasets
+        self.post_init_called = False
+
+    def post_init(self, data_parallel_rank, data_parallel_world_size, gradient_accumulation_steps):
+        self.data_parallel_rank = data_parallel_rank
+        self.data_parallel_world_size = data_parallel_world_size
+        self.gradient_accumulation_steps = gradient_accumulation_steps
+
+        iteration_order = []
+        for dataset_index, dataset in enumerate(self.datasets):
+            iteration_order.extend((dataset_index, item_index) for item_index in range(len(dataset)))
+        shuffle_with_seed(iteration_order, 0)
+
+        # Keep every rank and every accumulation slot populated. Unlike regular
+        # buckets, this truncates only once across the complete dataset.
+        logical_batch_size = data_parallel_world_size * gradient_accumulation_steps
+        new_length = (len(iteration_order) // logical_batch_size) * logical_batch_size
+        self.iteration_order = iteration_order[:new_length]
+        if new_length == 0 and is_main_process():
+            logger.warning(
+                'The unbucketed dataset is being completely dropped because it does not '
+                'contain one complete gradient-accumulation batch across all data-parallel ranks'
+            )
+        self.post_init_called = True
+
+    def __len__(self):
+        assert self.post_init_called
+        return len(self.iteration_order) // self.data_parallel_world_size
+
+    def __getitem__(self, idx):
+        assert self.post_init_called
+        global_index = idx * self.data_parallel_world_size + self.data_parallel_rank
+        dataset_index, item_index = self.iteration_order[global_index]
+        return [self.datasets[dataset_index][item_index]]
 
 
 class NSYNCBatchedDataset:
@@ -604,11 +660,20 @@ class DirectoryDataset:
         self.model_name = model_name
         self.framerate = framerate
         self.round_to_multiple = round_to_multiple
+        self.unbucketed = dataset_config.get('unbucketed', False)
         self.enable_ar_bucket = directory_config.get('enable_ar_bucket', dataset_config.get('enable_ar_bucket', False))
         # Configure directly from user-specified size buckets.
         self.size_buckets = directory_config.get('size_buckets', dataset_config.get('size_buckets', None))
-        self.use_size_buckets = (self.size_buckets is not None)
-        if self.use_size_buckets:
+        self.use_size_buckets = self.unbucketed or (self.size_buckets is not None)
+        if self.unbucketed:
+            self.resolutions = self._process_user_provided_resolutions(
+                directory_config.get('resolutions', dataset_config.get('resolutions'))
+            )
+            if len(self.resolutions) != 1:
+                raise ValueError('unbucketed=true requires exactly one target resolution per directory')
+            self.target_resolution = self.resolutions[0]
+            self.size_bucket_datasets = []
+        elif self.use_size_buckets:
             # sort size bucket from longest frame length to shortest
             self.size_buckets.sort(key=lambda t: t[-1], reverse=True)
             self.size_buckets = np.array(self.size_buckets)
@@ -631,7 +696,8 @@ class DirectoryDataset:
         self.control_path = Path(self.directory_config['control_path']) if 'control_path' in self.directory_config else None
         # For testing. Default if a mask is missing.
         self.default_mask_file = Path(self.directory_config['default_mask_file']) if 'default_mask_file' in self.directory_config else None
-        self.cache_dir = self.path / 'cache' / self.model_name
+        cache_name = f'{self.model_name}_unbucketed' if self.unbucketed else self.model_name
+        self.cache_dir = self.path / 'cache' / cache_name
         self.grouping_keys_json_file = self.cache_dir / 'metadata/grouping_keys.json'
         self.skip_empty_caption = directory_config.get('skip_empty_caption', dataset_config.get('skip_empty_caption', True))
 
@@ -646,7 +712,9 @@ class DirectoryDataset:
         if self.default_mask_file is not None and (not self.default_mask_file.exists() or not self.default_mask_file.is_file()):
             raise RuntimeError(f'Invalid default_mask_file: {self.default_mask_file}')
 
-        if self.use_size_buckets:
+        if self.unbucketed:
+            self.ars = np.array([])
+        elif self.use_size_buckets:
             self.ars = np.array([w / h for w, h, _ in self.size_buckets])
         elif not self.enable_ar_bucket:
             self.ars = np.array([1.0])
@@ -657,14 +725,15 @@ class DirectoryDataset:
             max_ar = self.directory_config.get('max_ar', self.dataset_config['max_ar'])
             num_ar_buckets = self.directory_config.get('num_ar_buckets', self.dataset_config['num_ar_buckets'])
             self.ars = np.geomspace(min_ar, max_ar, num=num_ar_buckets)
-        self.ars = dedup_and_sort(self.ars)
-        self.log_ars = np.log(self.ars)
-        frame_buckets = self.directory_config.get('frame_buckets', self.dataset_config.get('frame_buckets', [1]))
-        if 1 not in frame_buckets:
-            # always have an image bucket for convenience
-            frame_buckets.append(1)
-        frame_buckets.sort()
-        self.frame_buckets = np.array(frame_buckets)
+        if not self.unbucketed:
+            self.ars = dedup_and_sort(self.ars)
+            self.log_ars = np.log(self.ars)
+            frame_buckets = self.directory_config.get('frame_buckets', self.dataset_config.get('frame_buckets', [1]))
+            if 1 not in frame_buckets:
+                # always have an image bucket for convenience
+                frame_buckets.append(1)
+            frame_buckets.sort()
+            self.frame_buckets = np.array(frame_buckets)
 
         online_captions = directory_config.get('online_captions', dataset_config.get('online_captions', False))
         if online_captions:
@@ -685,6 +754,22 @@ class DirectoryDataset:
             quit()
 
     def cache_metadata(self, regenerate_cache=False, trust_cache=False):
+        if self.unbucketed:
+            metadata = self._get_ungrouped_metadata(
+                regenerate_cache=regenerate_cache,
+                trust_cache=trust_cache,
+            )
+            self.size_bucket_datasets.append(
+                SizeBucketDataset(
+                    metadata,
+                    self.directory_config,
+                    None,
+                    self.cache_dir,
+                    self,
+                )
+            )
+            return
+
         def check_grouped_metadata():
             all_grouped_metadata_exists = False
             unique_grouping_keys = None
@@ -960,15 +1045,35 @@ class DirectoryDataset:
                     filepath_or_file.close()
 
             is_video = (frames > 1)
-            log_ar = np.log(width / height)
 
-            if self.use_size_buckets:
+            if self.unbucketed:
+                if is_video and frames < 17:
+                    logger.warning(
+                        f'Video {image_file} has only {frames} frames after conversion to '
+                        'MiniMax H3\'s 24 fps and is being skipped; unbucketed H3 video '
+                        'samples require at least 17 frames.'
+                    )
+                    return empty_return
+                # Match the requested pixel area while retaining this sample's
+                # own aspect ratio. Frame length stays native; the model
+                # preprocessor applies H3's mandatory 17-frame alignment.
+                native_ar = width / height
+                target_area = self.target_resolution**2
+                target_width = math.sqrt(target_area * native_ar)
+                target_height = target_area / target_width
+                target_width = round_to_nearest_multiple(target_width, self.round_to_multiple)
+                target_height = round_to_nearest_multiple(target_height, self.round_to_multiple)
+                size_bucket = (target_width, target_height, frames)
+                ar_bucket = None
+            elif self.use_size_buckets:
+                log_ar = np.log(width / height)
                 size_bucket = self._find_closest_size_bucket(log_ar, frames, is_video)
                 if size_bucket is None:
                     print(f'video with frames={frames} is being skipped because it is too short')
                     return empty_return
                 ar_bucket = None
             else:
+                log_ar = np.log(width / height)
                 ar_bucket = self._find_closest_ar_bucket(log_ar, frames, is_video)
                 if ar_bucket is None:
                     print(f'video with frames={frames} is being skipped because it is too short')
@@ -1084,6 +1189,9 @@ class Dataset:
         self.dataset_config = dataset_config
         self.model = model
         self.model_name = self.model.name
+        self.unbucketed = dataset_config.get('unbucketed', False)
+        if self.unbucketed and self.model_name not in ('minimax_h3', 'minimax_h3_i2v_v1'):
+            raise ValueError('unbucketed=true is currently supported only for MiniMax H3')
         # TODO: remove. Doing this because Wan and Cosmos-Predict2 use the same latents.
         # if self.model_name == 'wan' and len(self.model.get_text_encoders()) == 0:
         #     self.model_name = 'cosmos_predict2'
@@ -1107,11 +1215,14 @@ class Dataset:
                 dataset_config,
                 self.model_name,
                 framerate=model.framerate,
-                round_to_multiple=model.pixels_round_to_multiple,
+                # MiniMax H3's preprocessor requires 32-pixel spatial alignment.
+                round_to_multiple=32 if self.unbucketed else model.pixels_round_to_multiple,
                 skip_dataset_validation=skip_dataset_validation,
             )
             self.directory_datasets.append(directory_dataset)
         self.nsync_enabled = len(nsync_roles_present) > 0
+        if self.unbucketed and self.nsync_enabled:
+            raise ValueError('unbucketed=true is not compatible with NSYNC')
         if self.nsync_enabled:
             if not getattr(model, 'nsync_enabled', False):
                 raise ValueError('Dataset contains nsync_role entries, but NSYNC is not enabled in the training config')
@@ -1129,7 +1240,24 @@ class Dataset:
         global_batch_size_image = {size: bs * gradient_accumulation_steps * self.data_parallel_world_size for size, bs in per_device_batch_size_image.items()}
 
         self.buckets = []
-        if self.nsync_enabled:
+        if self.unbucketed:
+            if any(batch_size != 1 for batch_size in per_device_batch_size.values()):
+                raise ValueError('unbucketed=true requires micro_batch_size_per_gpu=1')
+            if any(batch_size != 1 for batch_size in per_device_batch_size_image.values()):
+                raise ValueError('unbucketed=true requires image_micro_batch_size_per_gpu=1')
+            native_datasets = [
+                size_bucket_dataset
+                for directory_dataset in self.directory_datasets
+                for size_bucket_dataset in directory_dataset.get_size_bucket_datasets()
+            ]
+            bucket = UnbucketedBatchedDataset(native_datasets)
+            bucket.post_init(
+                data_parallel_rank,
+                data_parallel_world_size,
+                gradient_accumulation_steps,
+            )
+            self.buckets.append(bucket)
+        elif self.nsync_enabled:
             datasets_by_pair_and_bucket = defaultdict(lambda: defaultdict(list))
             anchor_pairs_by_pair = {}
             for directory_dataset in self.directory_datasets:
@@ -1218,6 +1346,8 @@ class Dataset:
 
         if subsample_ratio := self.dataset_config.get('subsample_ratio', None):
             new_len = int(len(self) * subsample_ratio)
+            if self.unbucketed:
+                new_len = (new_len // gradient_accumulation_steps) * gradient_accumulation_steps
             self.iteration_order = self.iteration_order[:new_len]
 
     def set_eval_quantile(self, quantile):
@@ -1580,9 +1710,19 @@ def split_batch(batch, pieces):
 class PipelineDataLoader:
     def __init__(self, dataset, model_engine, gradient_accumulation_steps, model, num_dataloader_workers=1):
         if len(dataset) == 0:
+            if dataset.unbucketed:
+                reason = (
+                    'The unbucketed dataset does not contain enough samples for one complete '
+                    'gradient-accumulation batch across all data-parallel ranks.\n'
+                    'Try decreasing gradient_accumulation_steps, or increasing num_repeats.\n'
+                )
+            else:
+                reason = (
+                    'Probably caused by rounding down for each size bucket.\n'
+                    'Try decreasing the global batch size, or increasing num_repeats.\n'
+                )
             raise RuntimeError(
-                'Processed dataset was empty. Probably caused by rounding down for each size bucket.\n'
-                'Try decreasing the global batch size, or increasing num_repeats.\n'
+                f'Processed dataset was empty. {reason}'
                 f'The dataset config that triggered this error was:\n{dataset.dataset_config}'
             )
         self.model = model
@@ -1614,6 +1754,8 @@ class PipelineDataLoader:
         return self
 
     def __len__(self):
+        if self.dataset.unbucketed:
+            return len(self.dataset)
         return len(self.dataset) * self.gradient_accumulation_steps
 
     def __next__(self):
@@ -1659,8 +1801,14 @@ class PipelineDataLoader:
                 broadcasted_targets.append(self._broadcast_target(t))
             label = (*broadcasted_targets, mask)
             self.num_batches_pulled += 1
-            for micro_batch in split_batch((features, label), self.gradient_accumulation_steps):
-                yield micro_batch
+            if self.dataset.unbucketed:
+                # Each dataset item is already one physical batch. Preparing it
+                # independently lets consecutive accumulation samples have
+                # unrelated spatial and temporal shapes.
+                yield features, label
+            else:
+                for micro_batch in split_batch((features, label), self.gradient_accumulation_steps):
+                    yield micro_batch
 
     def _broadcast_target(self, target):
         model_engine = self.model_engine

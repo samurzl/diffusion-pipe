@@ -2,12 +2,12 @@
 
 # FILL IN THESE PATHS
 output_dir = 'path_to_output_dir'
-dataset = 'your_dataset.toml'  # see minimax_h3_dataset.toml as an example
+dataset = 'your_dataset.toml'  # see minimax_h3_dataset.toml or minimax_h3_unbucketed_dataset.toml
 
 # training settings
 epochs = 1000
 micro_batch_size_per_gpu = 1
-image_micro_batch_size_per_gpu = 8  # 8 images in a batch uses about as much VRAM as a single 5-second video
+image_micro_batch_size_per_gpu = 8  # use 1 with minimax_h3_unbucketed_dataset.toml
 pipeline_stages = 1
 gradient_accumulation_steps = 1
 gradient_clipping = 1

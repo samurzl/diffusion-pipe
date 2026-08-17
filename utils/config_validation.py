@@ -210,6 +210,7 @@ DATASET_KEYS = {
     'size_buckets',
     'skip_empty_caption',
     'subsample_ratio',
+    'unbucketed',
 }
 
 DATASET_ROOT_KEYS = DATASET_KEYS - {
@@ -223,7 +224,17 @@ DATASET_ROOT_KEYS = DATASET_KEYS - {
     'path',
 }
 
-DATASET_DIRECTORY_KEYS = DATASET_KEYS - {'directory', 'subsample_ratio'}
+DATASET_DIRECTORY_KEYS = DATASET_KEYS - {'directory', 'subsample_ratio', 'unbucketed'}
+
+BUCKET_DATASET_KEYS = {
+    'ar_buckets',
+    'enable_ar_bucket',
+    'frame_buckets',
+    'max_ar',
+    'min_ar',
+    'num_ar_buckets',
+    'size_buckets',
+}
 
 BLOCK_SWAP_MODEL_TYPES = {
     'anima',
@@ -563,6 +574,14 @@ def _validate_batch_size(value: Any, key: str, errors: list[str]) -> None:
         if resolution in seen_resolutions:
             errors.append(f'{key} contains duplicate resolution {resolution!r}')
         seen_resolutions.add(resolution)
+
+
+def _batch_size_values(value: Any) -> list[Any]:
+    if isinstance(value, int) and not isinstance(value, bool):
+        return [value]
+    if isinstance(value, list):
+        return [pair[1] for pair in value if isinstance(pair, list) and len(pair) == 2]
+    return []
 
 
 def _validate_dtype(
@@ -1377,6 +1396,7 @@ def _validate_dataset_config(
     skip_dataset_validation: bool,
     nsync_expected: bool,
     model_type: str | None,
+    physical_batch_sizes: dict[str, Any],
     errors: list[str],
 ) -> None:
     _validate_known_keys(dataset_config, DATASET_ROOT_KEYS, description, errors)
@@ -1392,6 +1412,20 @@ def _validate_dataset_config(
         or not 0 < subsample_ratio <= 1
     ):
         errors.append(f'{description}.subsample_ratio must be a number in (0, 1]')
+
+    unbucketed = dataset_config.get('unbucketed', False)
+    if not isinstance(unbucketed, bool):
+        errors.append(f'{description}.unbucketed must be true or false')
+        unbucketed = False
+    if unbucketed:
+        if model_type != 'minimax_h3':
+            errors.append(f'{description}.unbucketed is currently supported only for MiniMax H3')
+        if nsync_expected:
+            errors.append(f'{description}.unbucketed is not compatible with NSYNC')
+        for key, value in physical_batch_sizes.items():
+            batch_sizes = _batch_size_values(value)
+            if not batch_sizes or any(batch_size != 1 for batch_size in batch_sizes):
+                errors.append(f'{description}.unbucketed requires {key}=1 for every configured resolution')
 
     for key in ('cache_shuffle_num',):
         if key in dataset_config:
@@ -1474,46 +1508,60 @@ def _validate_dataset_config(
 
         size_buckets = directory.get('size_buckets', dataset_config.get('size_buckets'))
         resolutions = directory.get('resolutions', dataset_config.get('resolutions'))
-        if size_buckets is not None:
-            if not isinstance(size_buckets, list) or not size_buckets:
-                errors.append(f'{prefix}.size_buckets must be a non-empty list')
-            else:
-                for bucket_index, bucket in enumerate(size_buckets):
-                    if not isinstance(bucket, list) or len(bucket) != 3 or not all(_positive_int(x) for x in bucket):
-                        errors.append(f'{prefix}.size_buckets[{bucket_index}] must be [width, height, frames] using positive integers')
-        elif not isinstance(resolutions, list) or not resolutions:
-            errors.append(f'{prefix} needs non-empty resolutions or size_buckets')
-        else:
-            if len(resolutions) > 3 and not skip_dataset_validation:
+        if unbucketed:
+            configured_bucket_keys = sorted(
+                key for key in BUCKET_DATASET_KEYS if key in directory or key in dataset_config
+            )
+            if configured_bucket_keys:
                 errors.append(
-                    f'{prefix} has {len(resolutions)} resolutions; this duplicates the dataset at every resolution. '
-                    'Use --i_know_what_i_am_doing if intentional'
+                    f'{prefix} must omit bucket settings when unbucketed=true: '
+                    f'{", ".join(configured_bucket_keys)}'
                 )
-            for resolution_index, resolution in enumerate(resolutions):
-                _validate_resolution(resolution, f'{prefix}.resolutions[{resolution_index}]', errors)
-
-        enable_ar_bucket = directory.get('enable_ar_bucket', dataset_config.get('enable_ar_bucket', False))
-        ar_buckets = directory.get('ar_buckets', dataset_config.get('ar_buckets'))
-        if enable_ar_bucket and size_buckets is None and ar_buckets is None:
-            for key in ('min_ar', 'max_ar', 'num_ar_buckets'):
-                value = directory.get(key, dataset_config.get(key))
-                valid = _positive_int(value) if key == 'num_ar_buckets' else _positive_number(value)
-                if not valid:
-                    errors.append(f'{prefix}.{key} must be positive when aspect-ratio bucketing is enabled')
-            min_ar = directory.get('min_ar', dataset_config.get('min_ar'))
-            max_ar = directory.get('max_ar', dataset_config.get('max_ar'))
-            if _positive_number(min_ar) and _positive_number(max_ar) and min_ar > max_ar:
-                errors.append(f'{prefix}.min_ar cannot exceed max_ar')
-        elif ar_buckets is not None:
-            if not isinstance(ar_buckets, list) or not ar_buckets:
-                errors.append(f'{prefix}.ar_buckets must be a non-empty list')
+            if not isinstance(resolutions, list) or len(resolutions) != 1:
+                errors.append(f'{prefix}.unbucketed requires exactly one target resolution')
             else:
-                for bucket_index, bucket in enumerate(ar_buckets):
-                    _validate_resolution(bucket, f'{prefix}.ar_buckets[{bucket_index}]', errors)
+                _validate_resolution(resolutions[0], f'{prefix}.resolutions[0]', errors)
+        else:
+            if size_buckets is not None:
+                if not isinstance(size_buckets, list) or not size_buckets:
+                    errors.append(f'{prefix}.size_buckets must be a non-empty list')
+                else:
+                    for bucket_index, bucket in enumerate(size_buckets):
+                        if not isinstance(bucket, list) or len(bucket) != 3 or not all(_positive_int(x) for x in bucket):
+                            errors.append(f'{prefix}.size_buckets[{bucket_index}] must be [width, height, frames] using positive integers')
+            elif not isinstance(resolutions, list) or not resolutions:
+                errors.append(f'{prefix} needs non-empty resolutions or size_buckets')
+            else:
+                if len(resolutions) > 3 and not skip_dataset_validation:
+                    errors.append(
+                        f'{prefix} has {len(resolutions)} resolutions; this duplicates the dataset at every resolution. '
+                        'Use --i_know_what_i_am_doing if intentional'
+                    )
+                for resolution_index, resolution in enumerate(resolutions):
+                    _validate_resolution(resolution, f'{prefix}.resolutions[{resolution_index}]', errors)
 
-        frame_buckets = directory.get('frame_buckets', dataset_config.get('frame_buckets', [1]))
-        if not isinstance(frame_buckets, list) or not frame_buckets or not all(_positive_int(x) for x in frame_buckets):
-            errors.append(f'{prefix}.frame_buckets must be a non-empty list of positive integers')
+            enable_ar_bucket = directory.get('enable_ar_bucket', dataset_config.get('enable_ar_bucket', False))
+            ar_buckets = directory.get('ar_buckets', dataset_config.get('ar_buckets'))
+            if enable_ar_bucket and size_buckets is None and ar_buckets is None:
+                for key in ('min_ar', 'max_ar', 'num_ar_buckets'):
+                    value = directory.get(key, dataset_config.get(key))
+                    valid = _positive_int(value) if key == 'num_ar_buckets' else _positive_number(value)
+                    if not valid:
+                        errors.append(f'{prefix}.{key} must be positive when aspect-ratio bucketing is enabled')
+                min_ar = directory.get('min_ar', dataset_config.get('min_ar'))
+                max_ar = directory.get('max_ar', dataset_config.get('max_ar'))
+                if _positive_number(min_ar) and _positive_number(max_ar) and min_ar > max_ar:
+                    errors.append(f'{prefix}.min_ar cannot exceed max_ar')
+            elif ar_buckets is not None:
+                if not isinstance(ar_buckets, list) or not ar_buckets:
+                    errors.append(f'{prefix}.ar_buckets must be a non-empty list')
+                else:
+                    for bucket_index, bucket in enumerate(ar_buckets):
+                        _validate_resolution(bucket, f'{prefix}.ar_buckets[{bucket_index}]', errors)
+
+            frame_buckets = directory.get('frame_buckets', dataset_config.get('frame_buckets', [1]))
+            if not isinstance(frame_buckets, list) or not frame_buckets or not all(_positive_int(x) for x in frame_buckets):
+                errors.append(f'{prefix}.frame_buckets must be a non-empty list of positive integers')
 
         caption_dir_value = directory.get('caption_path', media_path_value)
         caption_counts: dict[str, int] = {}
@@ -1788,6 +1836,11 @@ def load_and_validate_config(
     model_config = config.get('model', {})
     model_type = model_config.get('type') if isinstance(model_config, dict) else None
 
+    train_micro_batch = config.get('micro_batch_size_per_gpu', 1)
+    train_image_micro_batch = config.get('image_micro_batch_size_per_gpu', train_micro_batch)
+    eval_micro_batch = config.get('eval_micro_batch_size_per_gpu', train_micro_batch)
+    eval_image_micro_batch = config.get('eval_image_micro_batch_size_per_gpu', eval_micro_batch)
+
     loaded_dataset_entries: list[tuple[str, dict[str, Any]]] = []
     for description, dataset_path_value in dataset_entries:
         if not isinstance(dataset_path_value, str) or not dataset_path_value:
@@ -1806,6 +1859,16 @@ def load_and_validate_config(
         raise ConfigValidationError(errors)
 
     for description, dataset_config in loaded_dataset_entries:
+        if description == 'dataset':
+            physical_batch_sizes = {
+                'micro_batch_size_per_gpu': train_micro_batch,
+                'image_micro_batch_size_per_gpu': train_image_micro_batch,
+            }
+        else:
+            physical_batch_sizes = {
+                'eval_micro_batch_size_per_gpu': eval_micro_batch,
+                'eval_image_micro_batch_size_per_gpu': eval_image_micro_batch,
+            }
         _validate_dataset_config(
             dataset_config,
             description,
@@ -1813,6 +1876,7 @@ def load_and_validate_config(
             skip_dataset_validation=skip_dataset_validation,
             nsync_expected=nsync_expected,
             model_type=model_type,
+            physical_batch_sizes=physical_batch_sizes,
             errors=errors,
         )
 
@@ -1820,6 +1884,16 @@ def load_and_validate_config(
         raise ConfigValidationError(errors)
     if inspect_dataset_media:
         for description, dataset_config in loaded_dataset_entries:
+            if description == 'dataset':
+                physical_batch_sizes = {
+                    'micro_batch_size_per_gpu': train_micro_batch,
+                    'image_micro_batch_size_per_gpu': train_image_micro_batch,
+                }
+            else:
+                physical_batch_sizes = {
+                    'eval_micro_batch_size_per_gpu': eval_micro_batch,
+                    'eval_image_micro_batch_size_per_gpu': eval_image_micro_batch,
+                }
             _validate_dataset_config(
                 dataset_config,
                 description,
@@ -1827,6 +1901,7 @@ def load_and_validate_config(
                 skip_dataset_validation=skip_dataset_validation,
                 nsync_expected=nsync_expected,
                 model_type=model_type,
+                physical_batch_sizes=physical_batch_sizes,
                 errors=errors,
             )
 

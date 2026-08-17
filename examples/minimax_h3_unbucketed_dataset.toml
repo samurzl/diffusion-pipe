@@ -1,0 +1,17 @@
+# Unbucketed mode for small MiniMax H3 datasets. Every image/video is resized to
+# this pixel area while retaining its own aspect ratio and usable duration,
+# instead of being assigned to aspect-ratio or frame buckets.
+#
+# H3 still requires tensor alignment: width and height are rounded to the
+# nearest multiple of 32, and video length is rounded down to a multiple of 17.
+# Videos shorter than 17 frames after conversion to H3's 24 fps are skipped.
+unbucketed = true
+resolutions = [512]
+
+# Repeats are applied across the complete dataset. They can also ensure there
+# are enough samples to fill gradient_accumulation_steps across all data-parallel
+# ranks without dropping the final incomplete optimizer batch.
+num_repeats = 8
+
+[[directory]]
+path = '/path/to/images_and_videos'

@@ -55,6 +55,19 @@ lr = 1e-4
         )
         return config_path
 
+    def _convert_to_minimax_h3(self, config_path: Path, model_dir: Path) -> None:
+        config_path.write_text(
+            config_path.read_text()
+            .replace("type = 'wan'", "type = 'minimax_h3'")
+            .replace(
+                f"ckpt_path = {str(model_dir)!r}",
+                f"diffusion_model = {str(model_dir)!r}\n"
+                f"vae = {str(model_dir)!r}\n"
+                f"audio_vae = {str(model_dir)!r}\n"
+                f"text_encoders = [{{path = {str(model_dir)!r}, type = 'minimax'}}]",
+            )
+        )
+
     def test_valid_config_loads_main_and_dataset(self):
         with tempfile.TemporaryDirectory() as tmp:
             config_path = self._write_valid_config(Path(tmp))
@@ -62,6 +75,116 @@ lr = 1e-4
 
         self.assertEqual(config['model']['type'], 'wan')
         self.assertEqual(len(datasets), 1)
+
+    def test_minimax_h3_unbucketed_dataset_accepts_native_samples(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_path = self._write_valid_config(root)
+            dataset_path = root / 'dataset.toml'
+            media_dir = root / 'media'
+            dataset_path.write_text(
+                f'''\
+unbucketed = true
+resolutions = [512]
+num_repeats = 2
+
+[[directory]]
+path = {str(media_dir)!r}
+'''
+            )
+            self._convert_to_minimax_h3(config_path, root / 'model')
+
+            config, datasets = load_and_validate_config(config_path)
+
+        dataset = next(iter(datasets.values()))
+        self.assertEqual(config['model']['type'], 'minimax_h3')
+        self.assertTrue(dataset['unbucketed'])
+        self.assertEqual(dataset['resolutions'], [512])
+
+    def test_unbucketed_dataset_requires_physical_batch_size_one(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_path = self._write_valid_config(root)
+            dataset_path = root / 'dataset.toml'
+            media_dir = root / 'media'
+            dataset_path.write_text(
+                f'''\
+unbucketed = true
+resolutions = [512]
+
+[[directory]]
+path = {str(media_dir)!r}
+'''
+            )
+            self._convert_to_minimax_h3(config_path, root / 'model')
+            config_path.write_text(
+                config_path.read_text()
+                .replace('micro_batch_size_per_gpu = 1', 'micro_batch_size_per_gpu = 2')
+            )
+
+            with self.assertRaises(ConfigValidationError) as caught:
+                load_and_validate_config(config_path)
+
+        self.assertIn('unbucketed requires micro_batch_size_per_gpu=1', str(caught.exception))
+        self.assertIn('unbucketed requires image_micro_batch_size_per_gpu=1', str(caught.exception))
+
+    def test_unbucketed_dataset_rejects_bucket_settings_and_other_models(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_path = self._write_valid_config(root)
+            dataset_path = root / 'dataset.toml'
+            media_dir = root / 'media'
+            dataset_path.write_text(
+                f'''\
+unbucketed = true
+resolutions = [512]
+frame_buckets = [1, 34]
+
+[[directory]]
+path = {str(media_dir)!r}
+'''
+            )
+
+            with self.assertRaises(ConfigValidationError) as caught:
+                load_and_validate_config(config_path)
+
+        message = str(caught.exception)
+        self.assertIn('unbucketed is currently supported only for MiniMax H3', message)
+        self.assertIn('must omit bucket settings when unbucketed=true: frame_buckets', message)
+
+    def test_unbucketed_dataset_requires_exactly_one_resolution(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_path = self._write_valid_config(root)
+            dataset_path = root / 'dataset.toml'
+            media_dir = root / 'media'
+            self._convert_to_minimax_h3(config_path, root / 'model')
+
+            dataset_path.write_text(
+                f'''\
+unbucketed = true
+
+[[directory]]
+path = {str(media_dir)!r}
+'''
+            )
+            with self.assertRaises(ConfigValidationError) as missing:
+                load_and_validate_config(config_path)
+
+            dataset_path.write_text(
+                f'''\
+unbucketed = true
+resolutions = [512, 768]
+
+[[directory]]
+path = {str(media_dir)!r}
+'''
+            )
+            with self.assertRaises(ConfigValidationError) as multiple:
+                load_and_validate_config(config_path)
+
+        self.assertIn('unbucketed requires exactly one target resolution', str(missing.exception))
+        self.assertIn('unbucketed requires exactly one target resolution', str(multiple.exception))
 
     def test_minimax_h3_i2v_mode_and_visual_timestep_are_validated(self):
         with tempfile.TemporaryDirectory() as tmp:
