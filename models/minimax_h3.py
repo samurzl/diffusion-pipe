@@ -216,7 +216,9 @@ class MinimaxH3Pipeline(ComfyPipeline):
         if self.i2v:
             # Keep I2V caches separate from older T2V caches. I2V adds both a
             # separately encoded first-frame latent and Qwen vision tokens.
-            self.name = 'minimax_h3_i2v'
+            # Version the first supported schema so incomplete experimental
+            # I2V caches cannot be mistaken for working conditioning caches.
+            self.name = 'minimax_h3_i2v_v1'
         self.i2v_visual_cond_timestep = float(
             self.model_config.get('i2v_visual_cond_timestep', 0.999)
         )
@@ -494,15 +496,13 @@ class MinimaxH3Pipeline(ComfyPipeline):
 
         @torch.inference_mode()
         def fn(captions: list[str], is_video: list[bool], media: list):
-            if len(captions) != len(media):
+            if not len(captions) == len(is_video) == len(media):
                 raise ValueError('MiniMax H3 I2V text caching received mismatched captions and media')
 
             text_embeds, attention_masks, token_tags = [], [], []
-            for caption, video, first_frame in zip(captions, is_video, media):
-                images = [first_frame] if video else []
-                if video and first_frame is None:
-                    raise ValueError('MiniMax H3 I2V video is missing its first-frame text conditioning')
+            uncond_text_embeds, uncond_attention_masks, uncond_token_tags = [], [], []
 
+            def encode(caption, images):
                 tokens = text_encoder.tokenize(caption, images=images)
                 encoded = text_encoder.encode_from_tokens_scheduled(tokens)
                 embeds = encoded[0][0][0].to(self.dtype)
@@ -517,10 +517,28 @@ class MinimaxH3Pipeline(ComfyPipeline):
                             'MiniMax H3 text token tags did not match the expanded multimodal sequence: '
                             f'{tags.shape[0]} tags for {embeds.shape[0]} embeddings'
                         )
+                attention_mask = torch.ones(
+                    embeds.shape[0], dtype=torch.int64, device=embeds.device
+                )
+                return embeds, attention_mask, tags
 
+            for caption, video, first_frame in zip(captions, is_video, media):
+                images = [first_frame] if video else []
+                if video and first_frame is None:
+                    raise ValueError('MiniMax H3 I2V video is missing its first-frame text conditioning')
+
+                embeds, attention_mask, tags = encode(caption, images)
                 text_embeds.append(embeds)
-                attention_masks.append(torch.ones(embeds.shape[0], dtype=torch.int64, device=embeds.device))
+                attention_masks.append(attention_mask)
                 token_tags.append(tags)
+
+                # CFG and classifier-free caption dropout must retain the same
+                # first-frame vision presentation. A single global empty-prompt
+                # embedding would silently remove those image tokens.
+                embeds, attention_mask, tags = encode('', images)
+                uncond_text_embeds.append(embeds)
+                uncond_attention_masks.append(attention_mask)
+                uncond_token_tags.append(tags)
 
             # Lists intentionally preserve variable sequence lengths. The
             # dataset cache unbatches them into one tensor per example.
@@ -528,6 +546,9 @@ class MinimaxH3Pipeline(ComfyPipeline):
                 f'text_embeds_{te_idx}': text_embeds,
                 f'attention_mask_{te_idx}': attention_masks,
                 f'minimax_token_tags_{te_idx}': token_tags,
+                f'uncond_text_embeds_{te_idx}': uncond_text_embeds,
+                f'uncond_attention_mask_{te_idx}': uncond_attention_masks,
+                f'uncond_minimax_token_tags_{te_idx}': uncond_token_tags,
             }
 
         return fn
@@ -559,7 +580,10 @@ class MinimaxH3Pipeline(ComfyPipeline):
                 # check videos for missing audio and warn
                 missing_audio = sum(1 if a is None else 0 for a in audio)
                 if missing_audio > 0:
-                    print(f'WARNING: this batch had {missing_audio} videos without audio. The videos could have no audio track, or it could be a bug in the code.')
+                    print(
+                        f'WARNING: this batch had {missing_audio} videos without audio. '
+                        'Those samples will train video only and contribute no audio tokens or audio loss.'
+                    )
             images = images.to('cuda', self.dtype)
             latents, audio_latents = self.vae_encode(images, audio)
             result = {'latents': latents, 'audio_latents': audio_latents}
@@ -569,9 +593,9 @@ class MinimaxH3Pipeline(ComfyPipeline):
                     # slice of the full video latent is not equivalent because
                     # the H3 VAE's temporal path sees neighboring frames.
                     first_frame_latents, _ = self.vae_encode(
-                        images[:, :, 0], [None] * images.shape[0]
+                        images[:, :, :1], [None] * images.shape[0]
                     )
-                    result['i2v_first_frame_latents'] = first_frame_latents.unsqueeze(2)
+                    result['i2v_first_frame_latents'] = first_frame_latents
                 else:
                     # Images remain ordinary T2I/T2V-mode examples even when
                     # the run is configured for I2V. The empty temporal axis is
@@ -612,9 +636,9 @@ class MinimaxH3Pipeline(ComfyPipeline):
     # def to_layers(self):
     #     return [Wrapper(self.diffusion_model)]
 
-    def get_conds(self, inputs):
-        text_embeds = inputs['text_embeds_0']
-        attention_mask = inputs['attention_mask_0']
+    def get_conds(self, inputs, prefix=''):
+        text_embeds = inputs[f'{prefix}text_embeds_0']
+        attention_mask = inputs[f'{prefix}attention_mask_0']
         # text embeds are variable length
         max_seq_len = max([e.size(0) for e in text_embeds])
         text_embeds = torch.stack(
@@ -628,7 +652,7 @@ class MinimaxH3Pipeline(ComfyPipeline):
         if not self.i2v:
             return text_embeds, attention_mask
 
-        token_tags = inputs['minimax_token_tags_0']
+        token_tags = inputs[f'{prefix}minimax_token_tags_0']
         token_tags = torch.stack([
             torch.cat([u, u.new_ones(max_seq_len - u.size(0))]) for u in token_tags
         ]).to(torch.int64)
@@ -695,6 +719,38 @@ class MinimaxH3Pipeline(ComfyPipeline):
 
         bs, c, f, h, w = latents.shape
         device = latents.device
+
+        i2v_first_frame_latents = None
+        if self.i2v:
+            i2v_first_frame_latents = inputs['i2v_first_frame_latents']
+            if not torch.is_tensor(i2v_first_frame_latents) or i2v_first_frame_latents.ndim != 5:
+                raise RuntimeError(
+                    'MiniMax H3 I2V expected first-frame latents with shape [B, C, T, H, W]'
+                )
+            if i2v_first_frame_latents.shape[0] != bs:
+                raise RuntimeError(
+                    'MiniMax H3 I2V first-frame latent batch did not match the target batch'
+                )
+            cond_frames = i2v_first_frame_latents.shape[2]
+            if cond_frames not in (0, 1):
+                raise RuntimeError(
+                    f'MiniMax H3 I2V expected zero or one conditioning latent frame, got {cond_frames}'
+                )
+            if cond_frames == 1 and i2v_first_frame_latents.shape[1:] != (c, 1, h, w):
+                raise RuntimeError(
+                    'MiniMax H3 I2V first-frame latent shape did not match the target video: '
+                    f'{tuple(i2v_first_frame_latents.shape)} vs {tuple(latents.shape)}'
+                )
+            i2v_first_frame_latents = i2v_first_frame_latents.to(device=device, dtype=torch.float32)
+            if cond_frames == 1 and self.i2v_visual_cond_timestep < 1:
+                # Match ComfyUI's FL2VA conditioning augmentation. Sample it
+                # once here so the primary, Self-Flow teacher, and CFG branches
+                # all see exactly the same visual anchor.
+                visual_noise = torch.randn_like(i2v_first_frame_latents)
+                i2v_first_frame_latents = (
+                    self.i2v_visual_cond_timestep * i2v_first_frame_latents
+                    + (1 - self.i2v_visual_cond_timestep) * visual_noise
+                )
 
         audio_latents_list = inputs['audio_latents'] if 'audio_latents' in inputs else [None]*bs
 
@@ -808,13 +864,18 @@ class MinimaxH3Pipeline(ComfyPipeline):
             self_flow_weight = torch.zeros(bs, dtype=torch.float32, device=device)
 
         if self.cfg > 1:
-            tmp = {}
-            for k in ('text_embeds_0', 'attention_mask_0'):
-                v = self.uncond_dict[k]
-                if k == 'attention_mask_0':
-                    v = v.to(torch.bool)
-                tmp[k] = v.unsqueeze(0).repeat(bs, *([1]*v.ndim))
-            unconds = self.get_conds(tmp)
+            if self.i2v:
+                # These are cached per example with the same first-frame image
+                # tokens as the conditional presentation.
+                unconds = self.get_conds(inputs, prefix='uncond_')
+            else:
+                tmp = {}
+                for k in ('text_embeds_0', 'attention_mask_0'):
+                    v = self.uncond_dict[k]
+                    if k == 'attention_mask_0':
+                        v = v.to(torch.bool)
+                    tmp[k] = v.unsqueeze(0).repeat(bs, *([1]*v.ndim))
+                unconds = self.get_conds(tmp)
         else:
             unconds = tuple()
 
@@ -825,6 +886,8 @@ class MinimaxH3Pipeline(ComfyPipeline):
             roles = roles.to(device=device, dtype=torch.int64)
 
         features = (noisy_latents, noisy_audio_latents, valid_audio, t, roles)
+        if self.i2v:
+            features = (*features, i2v_first_frame_latents)
         if self.self_flow_enabled:
             features = (
                 *features,
@@ -962,14 +1025,39 @@ class InitialLayer(nn.Module):
             mod_segments.append((absolute_start, absolute_stop, row * 3 + modality_tag))
             output_segments.append((output_kind, absolute_start, absolute_stop, row))
 
+    @staticmethod
+    def _append_text_tag_runs(mod_segments, start, stop, timestep_row, token_tags):
+        if token_tags is None:
+            mod_segments.append((start, stop, timestep_row * 3 + 1))
+            return
+
+        tags = token_tags.reshape(-1).tolist()
+        if len(tags) != stop - start:
+            raise RuntimeError(
+                'MiniMax H3 text token tags did not match the padded text sequence: '
+                f'{len(tags)} tags for {stop - start} tokens'
+            )
+        run_start = 0
+        for index in range(1, len(tags) + 1):
+            if index == len(tags) or tags[index] != tags[run_start]:
+                tag = int(tags[run_start])
+                if tag not in (0, 1):
+                    raise RuntimeError(f'Unsupported MiniMax H3 text modality tag: {tag}')
+                mod_segments.append((
+                    start + run_start,
+                    start + index,
+                    timestep_row * 3 + tag,
+                ))
+                run_start = index
+
     def make_packed_sequence(self, video_x, audio_x, valid_audio, t, context, context_mask,
-                             mode='standard', s=None, video_token_mask=None, audio_token_mask=None):
+                             mode='standard', s=None, video_token_mask=None, audio_token_mask=None,
+                             first_frame_latents=None, text_token_tags=None):
         assert video_x.shape[0] == 1
         if not valid_audio.item():
             audio_x = torch.empty([1, 32, 2, 0], device=video_x.device)
 
         transformer_options = {}
-        payload = {}
         device = video_x.device
         dtype = context.dtype
         latent_t, lat_h, lat_w = video_x.shape[2:]
@@ -977,24 +1065,44 @@ class InitialLayer(nn.Module):
         if audio_token_mask is not None:
             audio_token_mask = audio_token_mask[..., :audio_t]
         text_len = context.shape[1]
-        layout = PackedLayout(text_len, latent_t, lat_h, lat_w, audio_t)
+        has_visual_condition = first_frame_latents is not None and first_frame_latents.numel() > 0
+        keyframes = [{'resolved_frame_index': 0}] if has_visual_condition else None
+        layout = PackedLayout(
+            text_len, latent_t, lat_h, lat_w, audio_t, keyframes=keyframes
+        )
 
         shift_v = float(transformer_options.get('minimax_h3_sigma_shift_video', self.sigma_shift_video))
         shift_a = float(transformer_options.get('minimax_h3_sigma_shift_audio', self.sigma_shift_audio))
         sigma_v = t.flatten()[0].float().clamp(min=1e-6)
         video_time = float(1.0 - sigma_v)
         audio_time = float(1.0 - time_shift_sigma(sigma_v, shift_v, shift_a))
+        visual_cond_time = max(
+            video_time, self.training_pipeline.i2v_visual_cond_timestep
+        )
 
         mod_segments = []
         output_segments = []
         if mode == 'standard':
-            timestep_values = sorted({video_time, audio_time})
-            rows = {value: index for index, value in enumerate(timestep_values)}
-            kind_rows = {'text': rows[video_time], 'video': rows[video_time], 'audio': rows[audio_time]}
-            kind_tags = {'text': 1, 'video': 0, 'audio': 2}
+            # Keep row count/order stable across a batch even when two numeric
+            # timestep values happen to be equal.
+            timestep_values = [video_time, audio_time]
+            kind_rows = {
+                'text': 0,
+                'cond': 2,
+                'video': 0,
+                'audio': 1,
+            }
+            if has_visual_condition:
+                timestep_values.append(visual_cond_time)
+            kind_tags = {'cond': 0, 'video': 0, 'audio': 2}
             for start, stop, kind in layout.segments:
                 row = kind_rows[kind]
-                mod_segments.append((start, stop, row * 3 + kind_tags[kind]))
+                if kind == 'text':
+                    self._append_text_tag_runs(
+                        mod_segments, start, stop, row, text_token_tags
+                    )
+                else:
+                    mod_segments.append((start, stop, row * 3 + kind_tags[kind]))
                 if kind == 'video':
                     output_segments.append((0, start, stop, row))
                 elif kind == 'audio':
@@ -1007,9 +1115,16 @@ class InitialLayer(nn.Module):
                 audio_time,
                 float(1.0 - time_shift_sigma(sigma_s, shift_v, shift_a)),
             ]
+            visual_cond_row = len(timestep_values)
+            if has_visual_condition:
+                timestep_values.append(visual_cond_time)
             for start, stop, kind in layout.segments:
                 if kind == 'text':
-                    mod_segments.append((start, stop, 1))
+                    self._append_text_tag_runs(
+                        mod_segments, start, stop, 0, text_token_tags
+                    )
+                elif kind == 'cond':
+                    mod_segments.append((start, stop, visual_cond_row * 3))
                 elif kind == 'video':
                     self._append_mask_runs(
                         mod_segments, output_segments, start, stop, video_token_mask,
@@ -1024,13 +1139,24 @@ class InitialLayer(nn.Module):
                     raise RuntimeError(f'Unsupported Self-Flow packed segment kind: {kind}')
         elif mode == 'teacher':
             sigma_min = torch.minimum(sigma_v, s.flatten()[0].float().clamp(min=1e-6))
+            teacher_video_time = float(1.0 - sigma_min)
+            teacher_visual_cond_time = max(
+                teacher_video_time, self.training_pipeline.i2v_visual_cond_timestep
+            )
             timestep_values = [
-                float(1.0 - sigma_min),
+                teacher_video_time,
                 float(1.0 - time_shift_sigma(sigma_min, shift_v, shift_a)),
             ]
+            visual_cond_row = len(timestep_values)
+            if has_visual_condition:
+                timestep_values.append(teacher_visual_cond_time)
             for start, stop, kind in layout.segments:
                 if kind == 'text':
-                    mod_segments.append((start, stop, 1))
+                    self._append_text_tag_runs(
+                        mod_segments, start, stop, 0, text_token_tags
+                    )
+                elif kind == 'cond':
+                    mod_segments.append((start, stop, visual_cond_row * 3))
                 elif kind == 'video':
                     mod_segments.append((start, stop, 0))
                     output_segments.append((0, start, stop, 0))
@@ -1043,25 +1169,20 @@ class InitialLayer(nn.Module):
             raise ValueError(f'Unknown MiniMax H3 packing mode: {mode}')
 
         img_update = layout.img_update.to(device)
-        audio_update = layout.audio_update.to(device)
         video_rows = patchify_video(video_x.to(torch.float32), self.patch_size)
         audio_rows = pack_audio(audio_x.to(torch.float32))
-        cond_video_rows = self._cond_video_rows(payload, device)
-        cond_audio_rows = self._cond_audio_rows(payload, device)
 
         all_video_rows = video_rows
-        if cond_video_rows is not None:
+        if has_visual_condition:
+            cond_video_rows = patchify_video(
+                first_frame_latents.to(device=device, dtype=torch.float32), self.patch_size
+            )
             all_video_rows = torch.empty(img_update.shape[0], video_rows.shape[1], dtype=torch.float32, device=device)
             all_video_rows[~img_update] = cond_video_rows
             all_video_rows[img_update] = video_rows
-        all_audio_rows = audio_rows
-        if cond_audio_rows is not None:
-            all_audio_rows = torch.empty(audio_update.shape[0], audio_rows.shape[1], dtype=torch.float32, device=device)
-            all_audio_rows[~audio_update] = cond_audio_rows
-            all_audio_rows[audio_update] = audio_rows
 
         video_embed = self.video_patch_proj(all_video_rows).to(dtype)
-        audio_embed = self.audio_patch_proj(all_audio_rows).to(dtype)
+        audio_embed = self.audio_patch_proj(audio_rows).to(dtype)
         text_states = context
         if text_states.shape[-1] != self.hidden_size:
             text_states = self.token_refiner(
@@ -1092,7 +1213,8 @@ class InitialLayer(nn.Module):
         return h, attention_mask, t_emb, mod_segments, rope_freqs, extra_ints, output_segments
 
     def make_layer_inputs(self, video_x, audio_x, valid_audio, t, context, context_mask,
-                          mode='standard', s=None, video_token_mask=None, audio_token_mask=None):
+                          mode='standard', s=None, video_token_mask=None, audio_token_mask=None,
+                          first_frame_latents=None, text_token_tags=None):
         first_mod_segments = first_output_segments = None
         h_list, attention_mask_list, t_emb_list = [], [], []
         batch_size = video_x.shape[0]
@@ -1108,6 +1230,12 @@ class InitialLayer(nn.Module):
                 s=None if s is None else s[index:index + 1],
                 video_token_mask=None if video_token_mask is None else video_token_mask[index:index + 1],
                 audio_token_mask=None if audio_token_mask is None else audio_token_mask[index:index + 1],
+                first_frame_latents=(
+                    None if first_frame_latents is None else first_frame_latents[index:index + 1]
+                ),
+                text_token_tags=(
+                    None if text_token_tags is None else text_token_tags[index:index + 1]
+                ),
             )
             h, attention_mask, t_emb, mod_segments, rope_freqs, extra_ints, output_segments = packed
             if first_mod_segments is None:
@@ -1118,7 +1246,8 @@ class InitialLayer(nn.Module):
                 and torch.equal(output_segments, first_output_segments)
             ):
                 raise RuntimeError(
-                    'MiniMax H3 requires shared Self-Flow token-mask segment boundaries within a microbatch'
+                    'MiniMax H3 requires shared packed segment boundaries within a physical microbatch. '
+                    'Use micro_batch_size_per_gpu=1 when mixing videos with and without audio.'
                 )
             h_list.append(h)
             attention_mask_list.append(attention_mask)
@@ -1140,6 +1269,10 @@ class InitialLayer(nn.Module):
     def forward(self, inputs):
         video_x, audio_x, valid_audio, t, roles, *variable = inputs
         pipeline = self.training_pipeline
+        if pipeline.i2v:
+            first_frame_latents, *variable = variable
+        else:
+            first_frame_latents = None
         if pipeline.self_flow_enabled:
             teacher_video_x, teacher_audio_x, s, video_token_mask, audio_token_mask, *variable = variable
             packing_mode = 'mixed'
@@ -1148,15 +1281,27 @@ class InitialLayer(nn.Module):
             packing_mode = 'standard'
 
         context, context_mask, *variable = variable
+        if pipeline.i2v:
+            text_token_tags, *variable = variable
+        else:
+            text_token_tags = None
         if pipeline.cfg > 1:
-            context_uncond, context_mask_uncond = variable
+            context_uncond, context_mask_uncond, *variable = variable
+            if pipeline.i2v:
+                uncond_text_token_tags, *variable = variable
+            else:
+                uncond_text_token_tags = None
         else:
             context_uncond = context_mask_uncond = None
+            uncond_text_token_tags = None
+        if variable:
+            raise RuntimeError(f'Unexpected MiniMax H3 pipeline inputs: {len(variable)} extra tensors')
 
         pipeline.set_self_flow_adapter(getattr(pipeline, 'self_flow_student_adapter', 'default'))
         primary = self.make_layer_inputs(
             video_x, audio_x, valid_audio, t, context, context_mask,
             mode=packing_mode, s=s, video_token_mask=video_token_mask, audio_token_mask=audio_token_mask,
+            first_frame_latents=first_frame_latents, text_token_tags=text_token_tags,
         )
         if pipeline.nsync_enabled:
             primary = (pipeline.nsync_controller.tag_output(primary[0], roles), *primary[1:])
@@ -1168,6 +1313,7 @@ class InitialLayer(nn.Module):
                 teacher = self.make_layer_inputs(
                     teacher_video_x, teacher_audio_x, valid_audio, t, context, context_mask,
                     mode='teacher', s=s,
+                    first_frame_latents=first_frame_latents, text_token_tags=text_token_tags,
                 )
             outputs = (*outputs, *_mark_no_backward(teacher))
             pipeline.set_self_flow_adapter(pipeline.self_flow_student_adapter)
@@ -1177,6 +1323,8 @@ class InitialLayer(nn.Module):
                 uncond = self.make_layer_inputs(
                     video_x, audio_x, valid_audio, t, context_uncond, context_mask_uncond,
                     mode=packing_mode, s=s, video_token_mask=video_token_mask, audio_token_mask=audio_token_mask,
+                    first_frame_latents=first_frame_latents,
+                    text_token_tags=uncond_text_token_tags,
                 )
             outputs = (*outputs, *_mark_no_backward(uncond))
 

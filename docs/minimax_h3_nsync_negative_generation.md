@@ -13,12 +13,13 @@ For every supported file directly inside the positive directory, the script:
 1. reads the matching same-stem `.txt` caption or the file's list in `captions.json`;
 2. removes each `--remove-text` phrase from the generation prompt;
 3. derives a generation canvas with the positive's aspect ratio;
-4. runs one text-conditioned local MiniMax H3 ComfyUI job;
-5. downloads the single saved result;
-6. writes a negative with the same filename stem; and
-7. normalizes the result to the positive's dimensions, 24 fps duration/frame count, media type, and audio presence.
+4. in `--mode i2v`, extracts and uploads frame zero of each positive video;
+5. runs one local MiniMax H3 ComfyUI job with text-only or first-frame conditioning;
+6. downloads the single saved result;
+7. writes a negative with the same filename stem; and
+8. normalizes the result to the positive's dimensions, 24 fps duration/frame count, media type, and audio presence.
 
-For an image positive, the negative is always a same-stem `.png` containing exactly one frame. H3 itself requires a minimum five-frame generation latent, so the generator decodes that minimum internally and extracts one normalized frame for the final image negative. For a video positive, the negative remains a same-stem `.mp4` and is trimmed or padded to the positive's exact 24 fps frame count. Extensions may differ because diffusion-pipe pairs NSYNC media by stem.
+For an image positive, the negative is always a same-stem `.png` containing exactly one frame. H3 itself requires a minimum five-frame generation latent, so the generator decodes that minimum internally and extracts one normalized frame for the final image negative. Image jobs remain unconditioned even when `--mode i2v` is selected, matching H3 I2V training's treatment of image buckets. For a video positive, the negative remains a same-stem `.mp4` and is trimmed or padded to the positive's exact 24 fps frame count. Extensions may differ because diffusion-pipe pairs NSYNC media by stem.
 
 The generated media and training captions serve different purposes:
 
@@ -30,7 +31,7 @@ The script does not copy rewritten prompts into the negative directory as captio
 ## Requirements
 
 - A locally running ComfyUI instance with local MiniMax H3 inference working.
-- The bundled H3 API workflow, or another H3 text-to-video workflow exported in ComfyUI **API format**.
+- The bundled H3 API workflow, or another local H3 workflow exported in ComfyUI **API format**. I2V mode requires `MiniMaxH3ImageToVideo`.
 - LightX2V's `minimax_h3_fl2v_turbo_4step_v1.0_768p_comfyui_bf16.safetensors` in ComfyUI's `models/loras` directory.
 - `ffmpeg` and `ffprobe` available on `PATH` or supplied through `--ffmpeg` and `--ffprobe`.
 - Positive media with same-stem `.txt` captions, or a standard `captions.json`.
@@ -107,12 +108,29 @@ To build a custom workflow, create and successfully run the generation graph onc
 
 1. Load the local MiniMax H3 diffusion model, video VAE, audio VAE, and MiniMax text encoder.
 2. Use `MiniMaxH3ImageToVideo` for the positive conditioning and empty AV latent.
-3. Leave `first_frame` and `last_frame` disconnected. Do not use the positive media as a reference: doing so can copy the target concept/style into the negative.
+3. Leave `first_frame` and `last_frame` disconnected. In I2V mode the generator injects a per-job `LoadImage` node connected to the matching positive clip; a pre-connected image could silently condition the wrong pair and is rejected.
 4. Decode the H3 video and audio outputs and combine them into the video saved by one `SaveVideo` node. Generated audio is required when a positive video has audio.
 5. Keep model filenames, sampling steps, sampler, scheduler, CFG, and local quantization settings in the workflow.
 6. Export the workflow in API format. A normal UI-format workflow contains a `nodes` list and cannot be queued through ComfyUI's `/prompt` endpoint.
 
-The script automatically finds one `MiniMaxH3ImageToVideo` node and prefers one `SaveVideo` output. Older local H3 workflows using `EmptyMiniMaxH3LatentAV` plus `CLIPTextEncode` are also supported. If a workflow has multiple matching nodes, select them with `--conditioning-node`, `--prompt-node`, `--shape-node`, or `--output-node`.
+The script automatically finds one `MiniMaxH3ImageToVideo` node and prefers one `SaveVideo` output. Older local H3 workflows using `EmptyMiniMaxH3LatentAV` plus `CLIPTextEncode` are supported only in the default T2V mode. If a workflow has multiple matching nodes, select them with `--conditioning-node`, `--prompt-node`, `--shape-node`, or `--output-node`.
+
+## Generate I2V negatives
+
+Use I2V negative generation when the training config sets `model.mode = 'i2v'`:
+
+```bash
+python tools/generate_minimax_h3_nsync_negatives.py \
+  /path/to/target_positive_media \
+  /path/to/generated_negative_media \
+  --mode i2v \
+  --remove-text 'TOKperson' \
+  --dry-run
+```
+
+For each video, the real run extracts frame zero with ffmpeg, uploads the PNG to ComfyUI's `input/diffusion_pipe_nsync` folder, and injects a `LoadImage` connection into that job's copied workflow. The tracked workflow JSON is not modified. The uploaded filename is deterministic and overwritten on a retry, while the manifest records its SHA-256 digest.
+
+I2V necessarily exposes a video's positive first frame to negative generation. Inspect the resulting pairs carefully: a frame dominated by the target identity or style can make the generated negative less useful even when the cleaned text prompt omits that target. Images in the same directory still use text-only negative generation. The ready [I2V + NSYNC training config](../examples/minimax_h3_i2v_nsync.toml) and [mixed paired dataset config](../examples/minimax_h3_i2v_nsync_dataset.toml) keep generation and training modes aligned.
 
 ## Prepare the positive directory
 
@@ -167,7 +185,8 @@ The dry run probes every positive and prints:
 - the final generation prompt;
 - the ComfyUI generation width, height, and requested length;
 - the normalized output dimensions and 24 fps frame count;
-- whether audio must be present; and
+- whether audio must be present;
+- whether each job uses T2V or I2V conditioning; and
 - the deterministic per-file seed.
 
 Repeat `--remove-text` for every trigger, target name, or style phrase that may appear:
@@ -197,14 +216,15 @@ python tools/generate_minimax_h3_nsync_negatives.py \
   --remove-text 'TOKperson'
 ```
 
-Jobs run sequentially because local MiniMax H3 inference uses batch size 1. An interrupted run is resumable: valid existing outputs are checked and skipped. If an existing same-stem output is invalid, the script stops instead of silently replacing it. Inspect the file and pass `--overwrite` when replacing it is intentional.
+Jobs run sequentially because local MiniMax H3 inference uses batch size 1. An interrupted run is resumable: valid existing outputs are checked and skipped. The recorded conditioning mode must also match, so switching an existing output directory between T2V and I2V requires `--overwrite`. If an existing same-stem output is invalid, the script stops instead of silently replacing it.
 
-The negative directory also receives `.nsync_generation_manifest.json`, which records each generation prompt, seed, ComfyUI prompt ID, source geometry, generation geometry, length, and audio requirement. Its `.json` extension means the training dataset loader ignores it as media.
+The negative directory also receives `.nsync_generation_manifest.json`, which records each generation prompt, seed, conditioning mode, ComfyUI prompt ID, source geometry, generation geometry, length, and audio requirement. I2V records also contain the extracted first-frame SHA-256 and ComfyUI input name. Its `.json` extension means the training dataset loader ignores it as media.
 
 Useful options:
 
 | Option | Purpose |
 |---|---|
+| `--mode {t2v,i2v}` | Use text-only generation, or condition every video on its matching positive first frame. |
 | `--comfy-url URL` | Select the ComfyUI server; defaults to `http://127.0.0.1:8188`. |
 | `--remove-text TEXT` | Remove a literal target phrase, case-insensitively; repeatable. |
 | `--prompt-template TEMPLATE` | Wrap the cleaned caption. Supports `{caption}`, `{stem}`, `{width}`, `{height}`, `{frames}`, and `{seconds}`. |
@@ -234,6 +254,9 @@ path = '/path/to/target_positive_media'
 num_repeats = 1
 nsync_role = 'positive'
 nsync_pair = 'target_style'
+# Optional: name other configured NSYNC groups whose positive examples should
+# supply anchors. If omitted, this group supplies its own anchors.
+# nsync_anchor_pairs = ['other_target', 'general_data']
 
 [[directory]]
 path = '/path/to/generated_negative_media'
@@ -243,7 +266,7 @@ nsync_role = 'negative'
 nsync_pair = 'target_style'
 ```
 
-The two directories must use the same `nsync_pair`. `caption_path` is essential: it gives every negative the exact positive training caption rather than the cleaned generation prompt.
+The two directories must use the same `nsync_pair`; that value is the group's name. Set `nsync_anchor_pairs` only on a positive directory. All referenced groups must exist and use matching bucket settings. Their positive examples are pooled as anchor candidates, with dataset size and `num_repeats` determining their relative frequency. Anchor assignments are shuffled deterministically once and reused across epochs. `caption_path` is essential: it gives every negative the exact positive training caption rather than the cleaned generation prompt.
 
 Enable NSYNC in the training configuration as shown in [`examples/minimax_h3_nsync_self_flow.toml`](../examples/minimax_h3_nsync_self_flow.toml):
 
@@ -254,6 +277,8 @@ eps = 1e-8
 ```
 
 Also keep `uncond_fraction = 0`, use data-parallel world size 1, and disable `optimizer.gradient_release`. See the [MiniMax H3 training notes](minimax_h3_notes.md) for the complete NSYNC and Self-Flow constraints.
+
+For I2V, use the mixed [`minimax_h3_i2v_nsync_dataset.toml`](../examples/minimax_h3_i2v_nsync_dataset.toml) and [`minimax_h3_i2v_nsync.toml`](../examples/minimax_h3_i2v_nsync.toml) examples. During NSYNC's three passes, video examples in the positive, negative, and independently sampled anchor role batches retain their own first-frame VAE keyframe and Qwen vision tokens; image examples have no first-frame conditioning.
 
 ## Troubleshooting
 
@@ -276,6 +301,10 @@ Decode the H3 audio latent and connect it to the video saved by `SaveVideo`. The
 ### Existing output is not a valid pair
 
 The same-stem output has different dimensions, frame duration, media type, or audio presence. Inspect it and use `--overwrite` to regenerate it.
+
+### Existing output was generated with a different mode
+
+The media shape is valid, but its manifest says it came from T2V while this run requests I2V, or vice versa. Use a separate negative directory per mode or pass `--overwrite` to regenerate intentionally. An existing I2V output without a manifest cannot be verified and is not silently reused.
 
 ### Generation times out
 

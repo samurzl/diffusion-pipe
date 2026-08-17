@@ -1,7 +1,7 @@
 # diffusion-pipe
 A pipeline parallel training script for diffusion models.
 
-Models supported: SDXL, Flux, LTX-Video, HunyuanVideo (t2v), Cosmos, Lumina Image 2.0, Wan2.1 (t2v and i2v), Chroma, HiDream, Stable Diffusion 3, Cosmos-Predict2, OmniGen2, Flux Kontext, Wan2.2, Qwen-Image, Qwen-Image-Edit, HunyuanImage-2.1, AuraFlow, Z-Image, HunyuanVideo-1.5, Flux 2 (Dev and Klein), Anima, Ernie-Image, LTX 2.3, Ideogram4, Krea 2, MiniMax H3.
+Models supported: SDXL, Flux, LTX-Video, HunyuanVideo (t2v), Cosmos, Lumina Image 2.0, Wan2.1 (t2v and i2v), Chroma, HiDream, Stable Diffusion 3, Cosmos-Predict2, OmniGen2, Flux Kontext, Wan2.2, Qwen-Image, Qwen-Image-Edit, HunyuanImage-2.1, AuraFlow, Z-Image, HunyuanVideo-1.5, Flux 2 (Dev and Klein), Anima, Ernie-Image, LTX 2.3, Ideogram4, Krea 2, MiniMax H3 (t2i, t2va, and i2v).
 
 ## Features
 - Pipeline parallelism, for training models larger than can fit on a single GPU
@@ -13,6 +13,8 @@ Models supported: SDXL, Flux, LTX-Video, HunyuanVideo (t2v), Cosmos, Lumina Imag
 - Easily add new models by implementing a single subclass
 
 ## Recent changes
+- 2026-08-17
+  - Add MiniMax H3 I2V training with first-frame VAE/Qwen conditioning, including NSYNC role batches and I2V negative generation.
 - 2026-08-10
   - Add NSYNC and Self-Flow LoRA training for MiniMax H3, including combined NSYNC + Self-Flow runs for joint video/audio training.
   - Add a local-ComfyUI utility for generating caption-matched MiniMax H3 NSYNC negative datasets from positive media.
@@ -114,7 +116,7 @@ MiniMax H3 NSYNC training needs a generated negative for every positive image or
 
 For an end-to-end manual setup starting from an empty GPU instance, follow the [RunPod MiniMax H3 NSYNC + Self-Flow guide](./docs/minimax_h3_nsync_self_flow_runpod.md). It covers installing ComfyUI and diffusion-pipe, downloading and placing each model, starting ComfyUI, generating the negative dataset, filling in the paired configs, pre-caching the dataset, and launching resumable training command by command. A [ready API-format H3 workflow](./examples/minimax_h3_t2va_api.json) is included for six-step inference with the LightX2V four-step Turbo LoRA at 0.3 MP.
 
-The utility reads positive `.txt` captions or `captions.json`, removes the target trigger/style text from the generation prompt, queues the local H3 workflow, and writes same-stem negative media. It also normalizes dimensions, frame count/duration, media type, and audio presence so the files pair correctly during NSYNC training.
+The utility reads positive `.txt` captions or `captions.json`, removes the target trigger/style text from the generation prompt, queues the local H3 workflow, and writes same-stem negative media. It supports text-only generation by default and `--mode i2v`, which injects each positive video's first frame into its matching generation job. It also normalizes dimensions, frame count/duration, media type, and audio presence so the files pair correctly during NSYNC training.
 
 Start with a dry run:
 
@@ -126,7 +128,7 @@ python tools/generate_minimax_h3_nsync_negatives.py \
   --dry-run
 ```
 
-Remove `--dry-run` to generate. The ready repository workflow is used by default. Place the models under the standard ComfyUI model directories, or pass `--comfy-root`, `--diffusion-model`, `--text-encoder`, `--video-vae`, `--audio-vae`, and `--turbo-lora` explicitly when the loader names differ. A custom workflow must be exported in API format, use the local `MiniMaxH3ImageToVideo` node without first/last-frame or reference conditioning, and save one decoded result through `SaveVideo`. See the [complete local ComfyUI negative-generation guide](./docs/minimax_h3_nsync_negative_generation.md), the [MiniMax H3 training notes](./docs/minimax_h3_notes.md), and the [paired dataset example](./examples/minimax_h3_nsync_self_flow_dataset.toml).
+Remove `--dry-run` to generate. Add `--mode i2v` when the training config uses `model.mode = 'i2v'`; the generator extracts and uploads the corresponding positive first frame automatically. The ready repository workflow is used by default. Place the models under the standard ComfyUI model directories, or pass `--comfy-root`, `--diffusion-model`, `--text-encoder`, `--video-vae`, `--audio-vae`, and `--turbo-lora` explicitly when the loader names differ. A custom workflow must be exported in API format, use the local `MiniMaxH3ImageToVideo` node with first/last-frame inputs disconnected, and save one decoded result through `SaveVideo`. See the [complete local ComfyUI negative-generation guide](./docs/minimax_h3_nsync_negative_generation.md), the [MiniMax H3 training notes](./docs/minimax_h3_notes.md), and the [I2V + NSYNC example](./examples/minimax_h3_i2v_nsync.toml).
 
 ## Supported models
 See the [supported models doc](./docs/supported_models.md) for more information on how to configure each model, the options it supports, and the format of the saved LoRAs.

@@ -63,6 +63,98 @@ lr = 1e-4
         self.assertEqual(config['model']['type'], 'wan')
         self.assertEqual(len(datasets), 1)
 
+    def test_minimax_h3_i2v_mode_and_visual_timestep_are_validated(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_path = self._write_valid_config(root)
+            model_dir = root / 'model'
+            minimax_config = (
+                config_path.read_text()
+                .replace("type = 'wan'", "type = 'minimax_h3'\nmode = 'i2v'\ni2v_visual_cond_timestep = 0.999")
+                .replace(
+                    f"ckpt_path = {str(model_dir)!r}",
+                    f"diffusion_model = {str(model_dir)!r}\n"
+                    f"vae = {str(model_dir)!r}\n"
+                    f"audio_vae = {str(model_dir)!r}\n"
+                    f"text_encoders = [{{path = {str(model_dir)!r}, type = 'minimax'}}]",
+                )
+            )
+            config_path.write_text(minimax_config)
+            config, _ = load_and_validate_config(config_path)
+            self.assertEqual(config['model']['mode'], 'i2v')
+
+            config_path.write_text(
+                minimax_config
+                .replace("mode = 'i2v'", "mode = 'reference'")
+                .replace('i2v_visual_cond_timestep = 0.999', 'i2v_visual_cond_timestep = 1.1')
+            )
+            with self.assertRaises(ConfigValidationError) as caught:
+                load_and_validate_config(config_path)
+
+        message = str(caught.exception)
+        self.assertIn('model.mode must be t2v or i2v', message)
+        self.assertIn('model.i2v_visual_cond_timestep must be in [0, 1]', message)
+
+    def test_minimax_h3_i2v_and_nsync_can_be_enabled_together(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_path = self._write_valid_config(root)
+            positive_dir = root / 'media'
+            (positive_dir / 'example.png').unlink()
+            (positive_dir / 'example.mp4').write_bytes(b'not decoded during preflight')
+            (positive_dir / 'still.png').write_bytes(b'not decoded during preflight')
+            (positive_dir / 'still.txt').write_text('a still image caption')
+            negative_dir = root / 'negative'
+            negative_dir.mkdir()
+            (negative_dir / 'example.mp4').write_bytes(b'not decoded during preflight')
+            (negative_dir / 'still.png').write_bytes(b'not decoded during preflight')
+            dataset_path = root / 'dataset.toml'
+            dataset_path.write_text(
+                f'''\
+resolutions = [512]
+frame_buckets = [1, 33]
+
+[[directory]]
+path = {str(positive_dir)!r}
+nsync_role = 'positive'
+nsync_pair = 'i2v'
+
+[[directory]]
+path = {str(negative_dir)!r}
+caption_path = {str(positive_dir)!r}
+nsync_role = 'negative'
+nsync_pair = 'i2v'
+'''
+            )
+            model_dir = root / 'model'
+            config_path.write_text(
+                config_path.read_text()
+                .replace("type = 'wan'", "type = 'minimax_h3'\nmode = 'i2v'")
+                .replace(
+                    f"ckpt_path = {str(model_dir)!r}",
+                    f"diffusion_model = {str(model_dir)!r}\n"
+                    f"vae = {str(model_dir)!r}\n"
+                    f"audio_vae = {str(model_dir)!r}\n"
+                    f"text_encoders = [{{path = {str(model_dir)!r}, type = 'minimax'}}]",
+                )
+                + '''\
+
+[adapter]
+type = 'lora'
+rank = 8
+
+[training_methods.nsync]
+enabled = true
+'''
+            )
+
+            config, datasets = load_and_validate_config(config_path, world_size=1)
+
+        self.assertEqual(config['model']['mode'], 'i2v')
+        self.assertTrue(config['training_methods']['nsync']['enabled'])
+        self.assertEqual(len(datasets), 1)
+        self.assertEqual(len(next(iter(datasets.values()))['directory']), 2)
+
     def test_reports_multiple_errors_in_one_pass(self):
         with tempfile.TemporaryDirectory() as tmp:
             config_path = Path(tmp) / 'broken.toml'
@@ -289,6 +381,82 @@ enabled = true
                 load_and_validate_config(config_path)
 
         self.assertIn('exactly one positive and one negative', str(caught.exception))
+
+    def test_nsync_anchor_pairs_are_checked_during_preflight(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_path = self._write_valid_config(root)
+            target_positive = root / 'media'
+            target_negative = root / 'target_negative'
+            anchor_positive = root / 'anchor_positive'
+            anchor_negative = root / 'anchor_negative'
+            for directory in (target_negative, anchor_positive, anchor_negative):
+                directory.mkdir()
+            (target_negative / 'example.png').write_bytes(b'not decoded during preflight')
+            (anchor_positive / 'anchor.png').write_bytes(b'not decoded during preflight')
+            (anchor_positive / 'anchor.txt').write_text('an anchor caption')
+            (anchor_negative / 'anchor.png').write_bytes(b'not decoded during preflight')
+
+            dataset_path = root / 'dataset.toml'
+            dataset_path.write_text(
+                f'''\
+resolutions = [512]
+
+[[directory]]
+path = {str(target_positive)!r}
+nsync_role = 'positive'
+nsync_pair = 'target'
+nsync_anchor_pairs = ['anchors']
+
+[[directory]]
+path = {str(target_negative)!r}
+caption_path = {str(target_positive)!r}
+nsync_role = 'negative'
+nsync_pair = 'target'
+
+[[directory]]
+path = {str(anchor_positive)!r}
+nsync_role = 'positive'
+nsync_pair = 'anchors'
+
+[[directory]]
+path = {str(anchor_negative)!r}
+caption_path = {str(anchor_positive)!r}
+nsync_role = 'negative'
+nsync_pair = 'anchors'
+'''
+            )
+            model_dir = root / 'model'
+            config_path.write_text(
+                config_path.read_text()
+                .replace("type = 'wan'", "type = 'minimax_h3'")
+                .replace(
+                    f"ckpt_path = {str(model_dir)!r}",
+                    f"diffusion_model = {str(model_dir)!r}\n"
+                    f"vae = {str(model_dir)!r}\n"
+                    f"audio_vae = {str(model_dir)!r}\n"
+                    f"text_encoders = [{{path = {str(model_dir)!r}, type = 'minimax'}}]",
+                )
+                + '''\
+
+[adapter]
+type = 'lora'
+rank = 8
+
+[training_methods.nsync]
+enabled = true
+'''
+            )
+
+            _, datasets = load_and_validate_config(config_path)
+            dataset_config = next(iter(datasets.values()))
+            self.assertEqual(dataset_config['directory'][0]['nsync_anchor_pairs'], ['anchors'])
+
+            dataset_path.write_text(dataset_path.read_text().replace("['anchors']", "['missing_group']"))
+            with self.assertRaises(ConfigValidationError) as caught:
+                load_and_validate_config(config_path)
+
+        self.assertIn("references unknown anchor pair 'missing_group'", str(caught.exception))
 
     def test_nsync_media_pairing_is_checked_during_preflight(self):
         with tempfile.TemporaryDirectory() as tmp:

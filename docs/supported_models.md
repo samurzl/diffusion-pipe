@@ -636,6 +636,9 @@ This configuration can train a rank 32 LoRA at 512 resolution with 24GB VRAM.
 ```
 [model]
 type = 'minimax_h3'
+# Set mode = 'i2v' to condition every video clip on its first frame.
+# mode = 'i2v'
+# i2v_visual_cond_timestep = 0.999  # ComfyUI default
 diffusion_model = '/data2/imagegen_models/comfyui-models/minimax_h3_fl2va_pruned_int8_convrot.safetensors'
 vae = '/data2/imagegen_models/comfyui-models/minimax_h3_video_vae_fp16.safetensors'
 audio_vae = '/data2/imagegen_models/comfyui-models/minimax_h3_audio_vae_fp32.safetensors'
@@ -648,8 +651,10 @@ shift = 8  # IDK what this should be but 1 is way too low for videos
 # CFG-augmented training to preserve distillation. Use either this or a training adapter (not both).
 cfg = 4
 ```
+`mode` defaults to `t2v`. With `mode = 'i2v'`, the first frame of every preprocessed video clip is independently encoded as H3's FL2VA keyframe and is also passed through Qwen as vision conditioning. Image samples in the same run receive neither condition: they remain ordinary text-conditioned image examples. Use `video_clip_mode = 'single_beginning'` when the source video's beginning should be the anchor. The [mixed I2V dataset example](../examples/minimax_h3_i2v_dataset.toml) includes frame bucket `1` for images alongside the video buckets.
+
 There is a document for [MiniMax H3 notes](minimax_h3_notes.md). Read the whole thing before you train. Also look at the [standard MiniMax H3 example](../examples/minimax_h3_example.toml) or the [combined NSYNC + Self-Flow example](../examples/minimax_h3_nsync_self_flow.toml).
 
-NSYNC requires caption-matched, same-stem generated negatives. The [local ComfyUI NSYNC negative-generation guide](minimax_h3_nsync_negative_generation.md) explains how to create them automatically with `tools/generate_minimax_h3_nsync_negatives.py`, validate the media pairing, and connect the output to the [paired dataset configuration](../examples/minimax_h3_nsync_self_flow_dataset.toml). The generator accepts only local MiniMax H3 workflows and rejects hosted MiniMax API nodes.
+NSYNC requires caption-matched, same-stem generated negatives and is compatible with both H3 modes. The [local ComfyUI NSYNC negative-generation guide](minimax_h3_nsync_negative_generation.md) explains how to create them automatically with `tools/generate_minimax_h3_nsync_negatives.py`; pass `--mode i2v` to condition each generated video on its matching positive first frame. The [I2V + NSYNC training](../examples/minimax_h3_i2v_nsync.toml) and [paired dataset](../examples/minimax_h3_i2v_nsync_dataset.toml) examples configure the corresponding role batches. The generator accepts only local MiniMax H3 workflows and rejects hosted MiniMax API nodes.
 
 Everything is ComfyUI format, including the saved models. You can now train LoRAs directly on quantized models, and it is recommended to use int8 convrot (faster, better quality, and less VRAM).

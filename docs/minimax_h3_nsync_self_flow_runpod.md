@@ -331,7 +331,7 @@ In RunPod, open **Connect > HTTP Service [Port 8188]**.
 
 ### Use the ready API workflow
 
-The repository includes [`examples/minimax_h3_t2va_api.json`](../examples/minimax_h3_t2va_api.json). It is already in ComfyUI API format and contains local text-only H3 conditioning, LightX2V's four-step v1.0 Turbo LoRA at strength 1.0, its required 6/3 video/audio sigma shift, Euler with six sampling steps, video and audio decoding, 24 fps muxing, and exactly one `SaveVideo` output. Its defaults are 736×416 (approximately 0.3 MP) and 56 frames (approximately 2.33 seconds, because H3 snaps a two-second request upward to its `17n+5` frame grid). It has no first-frame, last-frame, reference, or hosted MiniMax API connections.
+The repository includes [`examples/minimax_h3_t2va_api.json`](../examples/minimax_h3_t2va_api.json). It is already in ComfyUI API format and contains local H3 conditioning, LightX2V's four-step v1.0 Turbo LoRA at strength 1.0, its required 6/3 video/audio sigma shift, Euler with six sampling steps, video and audio decoding, 24 fps muxing, and exactly one `SaveVideo` output. Its defaults are 736×416 (approximately 0.3 MP) and 56 frames (approximately 2.33 seconds, because H3 snaps a two-second request upward to its `17n+5` frame grid). The tracked graph has no first-frame, last-frame, reference, or hosted MiniMax API connections; `--mode i2v` injects the matching positive first frame only into each in-memory job copy.
 
 `H3_WORKFLOW_API` points directly at the tracked workflow. The standard filenames downloaded in step 5 match its loader inputs. Confirm the graph is ready:
 
@@ -344,6 +344,8 @@ test -s "$H3_WORKFLOW_API" \
 No manual ComfyUI export is needed. The generator changes the prompt, width, height, length, seed, and filename prefix for every source file while leaving the tested sampling and AV decode graph intact.
 
 Mixed image/video datasets are handled per file. Image positives produce same-stem one-frame `.png` negatives; H3 generates its minimum five-frame latent internally and the utility extracts one frame. Video positives produce `.mp4` negatives normalized to the positive video's dimensions, duration, frame count, and audio presence.
+
+If the training config uses `model.mode = 'i2v'`, add `--mode i2v` to every dry-run and generation command below. Video jobs will upload and use their matching positive first frame; image jobs stay unconditioned. The mixed-media setup is shown in [`minimax_h3_i2v_nsync.toml`](../examples/minimax_h3_i2v_nsync.toml) with [`minimax_h3_i2v_nsync_dataset.toml`](../examples/minimax_h3_i2v_nsync_dataset.toml).
 
 You may omit `--workflow` because the generator defaults to this tracked graph. If your ComfyUI loader names differ from step 5, pass the five model files through the generator's explicit model arguments. The [manual ComfyUI workflow guide](minimax_h3_nsync_negative_generation.md#set-up-the-local-comfyui-workflow-manually) shows both the standard-filename and fully explicit forms.
 

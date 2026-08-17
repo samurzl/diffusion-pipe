@@ -5,7 +5,18 @@ from utils.nsync import (
     NSYNC_NEGATIVE,
     NSYNC_POSITIVE,
     NSYNCGradientController,
+    build_anchor_iteration_order,
 )
+
+
+def test_anchor_iteration_order_is_deterministic_across_groups():
+    first = build_anchor_iteration_order([2, 3], target_length=8, seed=1234)
+    second = build_anchor_iteration_order([2, 3], target_length=8, seed=1234)
+
+    assert first == second
+    assert len(first) == 8
+    assert set(first[:5]) == {(0, 0), (0, 1), (1, 0), (1, 1), (1, 2)}
+    assert all(source_index in (0, 1) for source_index, _ in first)
 
 
 def _backward_role(controller, parameters, gradients, role):

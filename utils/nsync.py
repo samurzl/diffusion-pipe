@@ -1,3 +1,5 @@
+import random
+
 import torch
 try:
     from deepspeed import comm as dist
@@ -13,6 +15,36 @@ NSYNC_ROLE_NAMES = {
     NSYNC_NEGATIVE: 'negative',
     NSYNC_ANCHOR: 'anchor',
 }
+
+
+def build_anchor_iteration_order(source_lengths, target_length, seed):
+    """Build a deterministic draw from one or more anchor sources.
+
+    Each complete cycle visits every anchor candidate once in shuffled order.
+    Additional cycles are reshuffled until there is one anchor for every target
+    occurrence. Returned tuples are ``(source_index, example_index)``.
+    """
+    source_lengths = list(source_lengths)
+    if target_length < 0:
+        raise ValueError('NSYNC anchor target length must be non-negative')
+    if any(length < 0 for length in source_lengths):
+        raise ValueError('NSYNC anchor source lengths must be non-negative')
+
+    candidates = [
+        (source_index, example_index)
+        for source_index, source_length in enumerate(source_lengths)
+        for example_index in range(source_length)
+    ]
+    if target_length and not candidates:
+        raise ValueError('NSYNC anchor sources contain no examples')
+
+    rng = random.Random(seed)
+    result = []
+    while len(result) < target_length:
+        cycle = candidates.copy()
+        rng.shuffle(cycle)
+        result.extend(cycle)
+    return result[:target_length]
 
 
 class NSYNCGradientController:

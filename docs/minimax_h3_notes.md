@@ -28,7 +28,21 @@ Training on images works fine. I saw some reports that it won't work; no, it doe
 
 I don't know what timestep distribution and shift value is optimal. `timestep_sample_method='uniform'` and `shift=12` matches the default inference schedule. Lowering shift to something like 8, or even lower, could help learn details at the expense of large-scale structure and motion.
 
-Only T2I and T2V training is supported, and this might not ever change. Reference training is very complex. First/last frame to video (FL2V) is less complex than reference, but for small-scale lora training, you can just train pure T2V to learn your concept / character / style. The model already has general-purpose first/last frame conditioning. It will retain that ability even with your T2V lora. Plus your lora is now more compatible and can be used in T2V mode as well. TLDR: why bother with FL2V training at small scale.
+## I2V training
+
+Set `model.mode = 'i2v'` to train H3's first-frame-to-video path. For every video clip, the trainer:
+
+- independently VAE-encodes the preprocessed first frame as a non-denoised FL2VA keyframe;
+- includes that same frame in Qwen's multimodal presentation and preserves its video token tags; and
+- reuses the identical visual condition in the normal, Self-Flow teacher, and CFG-augmented branches.
+
+`i2v_visual_cond_timestep = 0.999` matches ComfyUI's visual conditioning timestep/noise augmentation and normally should not be changed. `video_clip_mode` decides which source clip supplies the first frame; `single_beginning` is the usual I2V choice, while `single_middle` anchors a middle clip. Images and videos may be mixed freely: image samples skip both the FL2VA keyframe and Qwen vision condition, while video samples use both. [minimax_h3_i2v_dataset.toml](../examples/minimax_h3_i2v_dataset.toml) shows frame bucket `1` together with video buckets.
+
+I2V text caching is slower and larger than T2V caching because Qwen processes the first frame and stores a matching per-example unconditional presentation for CFG/classifier-free caption dropout. I2V and T2V use separate cache directories.
+
+Videos without an audio track are supported. They still receive normal text/video and, in I2V mode, first-frame training, but H3 omits their audio tokens and they contribute no audio loss. Videos with audio train both video and audio. Keep `micro_batch_size_per_gpu = 1` when the dataset mixes the two: audio-present and audio-absent samples have different packed layouts and cannot share one physical H3 microbatch. Gradient accumulation may still be used to increase the logical batch size.
+
+Last-frame and general reference-to-video training are not implemented.
 
 ## NSYNC LoRA training
 
@@ -43,14 +57,17 @@ The three H3 passes are sequential, so their activation graphs do not have to co
 Use [minimax_h3_nsync_self_flow_dataset.toml](../examples/minimax_h3_nsync_self_flow_dataset.toml) as the dataset template. Important data rules:
 
 - Every directory must set `nsync_role = 'positive'` or `'negative'`, and matching directories use the same `nsync_pair`.
+- `nsync_pair` is also the group name. On a group's positive directory, optional `nsync_anchor_pairs = ['group_b', 'group_c']` draws anchors from the pooled positive examples in those groups. Every listed group must use matching bucket settings. If omitted, anchors come from the group's own positives, preserving the original behavior.
 - Positive and negative media are paired by filename stem and must land in the same resolution/frame bucket. For video, generate the negative with the same frame count and dimensions.
 - The negative uses the exact positive caption. `caption_path` lets the negative directory reuse positive `.txt` files or `captions.json`.
 - The generated negative should preserve the caption's subject/content while omitting the target concept or style. The trainer does not synthesize negatives for you.
 - NSYNC currently requires data-parallel world size 1, `uncond_fraction = 0`, and no `optimizer.gradient_release`. NSYNC by itself can use pipeline parallelism.
 
+Anchor selection is deterministic, not resampled on every access. At dataset initialization, each size bucket builds an independently shuffled anchor order from the configured groups and reuses that order in every epoch. A repeated sample or a media item with multiple captions can occupy multiple dataset positions and therefore have more than one fixed anchor.
+
 ### Generating N-Sync negatives with local MiniMax H3 in ComfyUI
 
-Use [`tools/generate_minimax_h3_nsync_negatives.py`](../tools/generate_minimax_h3_nsync_negatives.py) to create the negative directory through a locally running MiniMax H3 ComfyUI workflow. It rejects hosted MiniMax API nodes, removes target phrases from generation prompts, preserves positive filename stems, and normalizes dimensions, frame duration, media type, and audio presence.
+Use [`tools/generate_minimax_h3_nsync_negatives.py`](../tools/generate_minimax_h3_nsync_negatives.py) to create the negative directory through a locally running MiniMax H3 ComfyUI workflow. It rejects hosted MiniMax API nodes, removes target phrases from generation prompts, preserves positive filename stems, and normalizes dimensions, frame duration, media type, and audio presence. With `--mode i2v`, every video job is conditioned on frame zero of its matching positive; image jobs remain unconditioned.
 
 The [complete local ComfyUI NSYNC negative-generation guide](minimax_h3_nsync_negative_generation.md) covers workflow construction, caption handling, dry runs, resuming, all important options, dataset configuration, and troubleshooting. The basic command is:
 
@@ -63,7 +80,7 @@ python tools/generate_minimax_h3_nsync_negatives.py \
   --dry-run
 ```
 
-Remove `--dry-run` after checking every cleaned prompt. Keep the negative dataset's `caption_path` pointed at the positive directory so training uses the exact positive caption, not the cleaned generation prompt.
+Remove `--dry-run` after checking every cleaned prompt. Add `--mode i2v` when using `model.mode = 'i2v'`, and start from [the ready I2V + NSYNC configs](../examples/minimax_h3_i2v_nsync.toml). Keep the negative dataset's `caption_path` pointed at the positive directory so training uses the exact positive caption, not the cleaned generation prompt. During NSYNC, video examples in the positive, negative, and anchor role batches use their own cached first-frame latent and Qwen vision tokens; image examples in those roles remain text-only.
 
 ## Self-Flow LoRA training
 

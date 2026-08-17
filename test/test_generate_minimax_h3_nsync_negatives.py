@@ -1,3 +1,5 @@
+import io
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -6,6 +8,7 @@ from unittest.mock import patch
 
 from tools.generate_minimax_h3_nsync_negatives import (
     DEFAULT_H3_WORKFLOW,
+    ComfyClient,
     GenerationError,
     MediaInfo,
     WorkItem,
@@ -13,6 +16,8 @@ from tools.generate_minimax_h3_nsync_negatives import (
     apply_workflow_model_overrides,
     bind_local_h3_workflow,
     build_parser,
+    effective_generation_mode,
+    extract_i2v_first_frame,
     find_output_resource,
     fit_generation_dimensions,
     load_api_workflow,
@@ -55,6 +60,7 @@ class GenerateMiniMaxH3NSyncNegativesTest(unittest.TestCase):
             ["positive", "negative", "--remove-text", "TOKperson"]
         )
         self.assertEqual(parsed.workflow, DEFAULT_H3_WORKFLOW)
+        self.assertEqual(parsed.mode, "t2v")
         self.assertTrue(DEFAULT_H3_WORKFLOW.is_file())
 
         with tempfile.TemporaryDirectory() as directory:
@@ -181,6 +187,9 @@ class GenerateMiniMaxH3NSyncNegativesTest(unittest.TestCase):
                 if isinstance(value, list):
                     self.assertIn(value[0], workflow)
 
+        i2v_binding = bind_local_h3_workflow(workflow, generation_mode="i2v")
+        self.assertEqual(i2v_binding.conditioning_node, "5")
+
     def test_bind_and_prepare_local_h3_workflow(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -209,6 +218,87 @@ class GenerateMiniMaxH3NSyncNegativesTest(unittest.TestCase):
             self.assertEqual(prepared["20"]["inputs"]["noise_seed"], 123)
             self.assertEqual(prepared["30"]["inputs"]["filename_prefix"], "nsync/shot_123")
             self.assertEqual(workflow["12"]["inputs"]["prompt"], "template prompt")
+
+    def test_i2v_mode_injects_uploaded_positive_first_frame(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workflow = local_h3_workflow()
+            binding = bind_local_h3_workflow(workflow, generation_mode="i2v")
+            media = MediaInfo(root / "shot.mp4", "video", 1920, 1080, 48, 24.0, 48, False)
+            item = WorkItem(
+                positive=media.path,
+                output=root / "shot.mp4",
+                caption="a person walking",
+                generation_prompt="a person walking",
+                media=media,
+                generation_width=1344,
+                generation_height=768,
+                generation_length=48,
+                seed=123,
+            )
+
+            prepared = prepare_workflow(
+                workflow,
+                binding,
+                item,
+                first_frame_image="diffusion_pipe_nsync/shot_123_first_frame.png",
+            )
+
+            self.assertEqual(binding.conditioning_node, "12")
+            load_node_id = prepared["12"]["inputs"]["first_frame"][0]
+            self.assertEqual(prepared[load_node_id]["class_type"], "LoadImage")
+            self.assertEqual(
+                prepared[load_node_id]["inputs"]["image"],
+                "diffusion_pipe_nsync/shot_123_first_frame.png",
+            )
+            self.assertNotIn("first_frame", workflow["12"]["inputs"])
+            self.assertEqual(effective_generation_mode("i2v", item), "i2v")
+
+    def test_i2v_mode_leaves_image_jobs_unconditioned(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "portrait.png"
+            media = MediaInfo(path, "image", 1024, 768, 1, 0.0, 1, False)
+            item = WorkItem(path, path, "caption", "caption", media, 1024, 768, 5, 7)
+
+            self.assertEqual(effective_generation_mode("i2v", item), "t2v")
+
+    def test_i2v_first_frame_is_extracted_and_uploaded(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            positive_path = root / "shot.mp4"
+            positive_path.touch()
+            first_frame = root / "first.png"
+            media = MediaInfo(positive_path, "video", 1280, 720, 48, 24.0, 48, False)
+
+            def write_frame(command, _source, destination):
+                self.assertEqual(command[command.index("-frames:v") + 1], "1")
+                destination.write_bytes(b"png data")
+
+            with patch(
+                "tools.generate_minimax_h3_nsync_negatives._run_ffmpeg",
+                side_effect=write_frame,
+            ):
+                extract_i2v_first_frame(media, first_frame, "ffmpeg")
+
+            response = io.BytesIO(
+                json.dumps(
+                    {
+                        "name": "shot_first.png",
+                        "subfolder": "diffusion_pipe_nsync",
+                        "type": "input",
+                    }
+                ).encode("utf-8")
+            )
+            client = ComfyClient("http://127.0.0.1:8188", 60, 1)
+            with patch("urllib.request.urlopen", return_value=response) as urlopen:
+                uploaded = client.upload_image(first_frame, "shot first.png")
+
+            self.assertEqual(uploaded, "diffusion_pipe_nsync/shot_first.png")
+            request = urlopen.call_args.args[0]
+            self.assertEqual(request.full_url, "http://127.0.0.1:8188/upload/image")
+            self.assertIn(b'name="image"', request.data)
+            self.assertIn(b'filename="shot_first.png"', request.data)
+            self.assertIn(b"png data", request.data)
 
     def test_hosted_minimax_node_is_rejected(self):
         workflow = local_h3_workflow()

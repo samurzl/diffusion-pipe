@@ -1,0 +1,16 @@
+# Mixed image/video dataset for MiniMax H3 mode = 'i2v'. Video clips use their
+# first frame as both the H3 keyframe latent and Qwen vision input. Still images
+# remain ordinary text-conditioned image examples with no visual condition.
+
+resolutions = [512]
+enable_ar_bucket = true
+min_ar = 0.5
+max_ar = 2.0
+num_ar_buckets = 9
+
+# Frame bucket 1 enables images. H3's video VAE works in chunks of 17 frames.
+frame_buckets = [1, 34, 68, 102, 136]
+num_repeats = 8
+
+[[directory]]
+path = '/path/to/images_and_videos'

@@ -8,9 +8,10 @@ media file, this script:
 
 1. reads the matching caption from ``<stem>.txt`` or ``captions.json``;
 2. removes user-supplied target/style text from the generation prompt;
-3. queues a copy of the local H3 workflow through ComfyUI's HTTP API;
-4. downloads the workflow output; and
-5. uses ffmpeg to match the positive's dimensions, 24 fps duration/frame count,
+3. optionally conditions video negatives on the matching positive's first frame;
+4. queues a copy of the local H3 workflow through ComfyUI's HTTP API;
+5. downloads the workflow output; and
+6. uses ffmpeg to match the positive's dimensions, 24 fps duration/frame count,
    media type, and audio presence.
 
 The output keeps the positive filename stem, which is how diffusion-pipe pairs
@@ -48,6 +49,8 @@ H3_FPS = 24.0
 H3_DIMENSION_MULTIPLE = 32
 H3_MIN_LENGTH = 5
 H3_MAX_LENGTH = 3600
+GENERATION_MODES = ("t2v", "i2v")
+I2V_UPLOAD_SUBFOLDER = "diffusion_pipe_nsync"
 DEFAULT_H3_WORKFLOW = (
     Path(__file__).resolve().parents[1] / "examples" / "minimax_h3_t2va_api.json"
 )
@@ -132,6 +135,7 @@ class WorkflowBinding:
     output_node: str
     default_width: int
     default_height: int
+    conditioning_node: str | None = None
 
 
 @dataclass(frozen=True)
@@ -468,7 +472,12 @@ def bind_local_h3_workflow(
     prompt_node: str | None = None,
     shape_node: str | None = None,
     output_node: str | None = None,
+    generation_mode: str = "t2v",
 ) -> WorkflowBinding:
+    if generation_mode not in GENERATION_MODES:
+        raise GenerationError(
+            f"Unknown generation mode {generation_mode!r}; expected one of {', '.join(GENERATION_MODES)}"
+        )
     class_types = {node["class_type"] for node in workflow.values()}
     hosted = sorted(
         class_type
@@ -489,6 +498,12 @@ def bind_local_h3_workflow(
         if node["class_type"] == "MiniMaxH3ImageToVideo"
         and {"prompt", "width", "height", "length"}.issubset(node["inputs"])
     ]
+    if generation_mode == "i2v" and conditioning_node is None and not conditioning_candidates:
+        raise GenerationError(
+            "--mode i2v requires a local MiniMaxH3ImageToVideo conditioning node; "
+            "legacy EmptyMiniMaxH3LatentAV workflows only support --mode t2v"
+        )
+    selected_conditioning = None
     if conditioning_node is not None or conditioning_candidates:
         selected = _choose_node(
             workflow,
@@ -501,14 +516,25 @@ def bind_local_h3_workflow(
             raise GenerationError(
                 f"Conditioning node {selected} must be MiniMaxH3ImageToVideo, not {node['class_type']}"
             )
-        for reference_input in ("first_frame", "last_frame"):
-            if node["inputs"].get(reference_input) is not None:
-                raise GenerationError(
-                    f"Conditioning node {selected} has {reference_input} connected. N-Sync negatives "
-                    "must be text-to-video so the positive target/style is not copied into the negative."
+        if node["inputs"].get("first_frame") is not None:
+            if generation_mode == "i2v":
+                detail = (
+                    "disconnect it because --mode i2v injects the matching positive clip's "
+                    "first frame for every job"
                 )
+            else:
+                detail = "use --mode i2v to inject the matching positive clip's first frame"
+            raise GenerationError(
+                f"Conditioning node {selected} has first_frame connected; {detail}"
+            )
+        if node["inputs"].get("last_frame") is not None:
+            raise GenerationError(
+                f"Conditioning node {selected} has last_frame connected; N-Sync generation does not "
+                "support last-frame conditioning"
+            )
         prompt_id = shape_id = selected
         prompt_input = "prompt"
+        selected_conditioning = selected
     else:
         shape_candidates = [
             node_id
@@ -564,13 +590,23 @@ def bind_local_h3_workflow(
         output_node=output_id,
         default_width=default_width,
         default_height=default_height,
+        conditioning_node=selected_conditioning,
     )
+
+
+def _next_workflow_node_id(workflow: dict[str, dict[str, Any]]) -> str:
+    numeric_ids = [int(node_id) for node_id in workflow if str(node_id).isdigit()]
+    candidate = max(numeric_ids, default=0) + 1
+    while str(candidate) in workflow:
+        candidate += 1
+    return str(candidate)
 
 
 def prepare_workflow(
     template: dict[str, dict[str, Any]],
     binding: WorkflowBinding,
     item: WorkItem,
+    first_frame_image: str | None = None,
 ) -> dict[str, dict[str, Any]]:
     workflow = copy.deepcopy(template)
     workflow[binding.prompt_node]["inputs"][binding.prompt_input] = item.generation_prompt
@@ -578,6 +614,19 @@ def prepare_workflow(
     shape_inputs["width"] = item.generation_width
     shape_inputs["height"] = item.generation_height
     shape_inputs["length"] = item.generation_length
+
+    if first_frame_image is not None:
+        if binding.conditioning_node is None:
+            raise GenerationError(
+                "I2V first-frame injection requires a MiniMaxH3ImageToVideo conditioning node"
+            )
+        load_image_node = _next_workflow_node_id(workflow)
+        workflow[load_image_node] = {
+            "class_type": "LoadImage",
+            "inputs": {"image": first_frame_image},
+            "_meta": {"title": "NSYNC positive first frame"},
+        }
+        workflow[binding.conditioning_node]["inputs"]["first_frame"] = [load_image_node, 0]
 
     for node in workflow.values():
         for input_name in ("seed", "noise_seed"):
@@ -631,6 +680,65 @@ class ComfyClient:
         if not prompt_id:
             raise GenerationError(f"ComfyUI did not return a prompt ID: {response}")
         return str(prompt_id)
+
+    def upload_image(self, source: Path, remote_filename: str) -> str:
+        try:
+            image_data = source.read_bytes()
+        except OSError as error:
+            raise GenerationError(f"Could not read I2V first frame {source}: {error}") from error
+
+        safe_filename = re.sub(r"[^A-Za-z0-9_.-]+", "_", Path(remote_filename).name)
+        if not safe_filename.lower().endswith(".png"):
+            safe_filename += ".png"
+        boundary = f"----diffusion-pipe-{uuid.uuid4().hex}"
+        parts = []
+        for name, value in (
+            ("type", "input"),
+            ("subfolder", I2V_UPLOAD_SUBFOLDER),
+            ("overwrite", "true"),
+        ):
+            parts.append(
+                (
+                    f'--{boundary}\r\nContent-Disposition: form-data; name="{name}"\r\n\r\n'
+                    f"{value}\r\n"
+                ).encode("utf-8")
+            )
+        parts.append(
+            (
+                f'--{boundary}\r\nContent-Disposition: form-data; name="image"; '
+                f'filename="{safe_filename}"\r\nContent-Type: image/png\r\n\r\n'
+            ).encode("utf-8")
+            + image_data
+            + b"\r\n"
+        )
+        parts.append(f"--{boundary}--\r\n".encode("ascii"))
+        request = urllib.request.Request(
+            f"{self.base_url}/upload/image",
+            data=b"".join(parts),
+            headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=120) as response:
+                result = json.loads(response.read())
+        except urllib.error.HTTPError as error:
+            body = error.read().decode("utf-8", errors="replace")
+            raise GenerationError(
+                f"ComfyUI returned HTTP {error.code} while uploading the I2V first frame: {body}"
+            ) from error
+        except urllib.error.URLError as error:
+            raise GenerationError(
+                f"Could not upload the I2V first frame to local ComfyUI at {self.base_url}: {error}"
+            ) from error
+        except json.JSONDecodeError as error:
+            raise GenerationError("ComfyUI returned invalid JSON for /upload/image") from error
+
+        if not isinstance(result, dict):
+            raise GenerationError(f"ComfyUI returned an invalid image upload response: {result}")
+        name = result.get("name")
+        subfolder = result.get("subfolder", "")
+        if not isinstance(name, str) or not name or not isinstance(subfolder, str):
+            raise GenerationError(f"ComfyUI returned an invalid image upload response: {result}")
+        return f"{subfolder.rstrip('/')}/{name}" if subfolder else name
 
     def wait(self, prompt_id: str) -> dict[str, Any]:
         deadline = time.monotonic() + self.timeout
@@ -706,8 +814,60 @@ def _run_ffmpeg(command: list[str], source: Path, destination: Path) -> None:
     except subprocess.CalledProcessError as error:
         detail = error.stderr.strip() or error.stdout.strip()
         raise GenerationError(
-            f"ffmpeg could not normalize {source.name} to {destination.name}: {detail}"
+            f"ffmpeg could not process {source.name} to {destination.name}: {detail}"
         ) from error
+
+
+def extract_i2v_first_frame(positive: MediaInfo, destination: Path, ffmpeg: str) -> None:
+    if positive.kind != "video":
+        raise GenerationError(
+            f"I2V first-frame extraction requires a video, got {positive.path.name}"
+        )
+    command = [
+        ffmpeg,
+        "-nostdin",
+        "-y",
+        "-v",
+        "error",
+        "-i",
+        str(positive.path),
+        "-map",
+        "0:v:0",
+        "-frames:v",
+        "1",
+        str(destination),
+    ]
+    _run_ffmpeg(command, positive.path, destination)
+    if not destination.is_file():
+        raise GenerationError(
+            f"ffmpeg did not write the I2V first frame for {positive.path.name}"
+        )
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    try:
+        with path.open("rb") as file:
+            for chunk in iter(lambda: file.read(1024 * 1024), b""):
+                digest.update(chunk)
+    except OSError as error:
+        raise GenerationError(f"Could not hash {path}: {error}") from error
+    return digest.hexdigest()
+
+
+def effective_generation_mode(requested_mode: str, item: WorkItem) -> str:
+    # H3 I2V training treats image buckets as ordinary unconditioned examples,
+    # so mixed datasets only receive first-frame conditioning for video jobs.
+    return "i2v" if requested_mode == "i2v" and item.media.kind == "video" else "t2v"
+
+
+def recorded_generation_mode(record: Any) -> str | None:
+    if not isinstance(record, dict):
+        return None
+    mode = record.get("conditioning_mode")
+    if mode is None:
+        mode = record.get("generation_mode", "t2v")
+    return mode if mode in GENERATION_MODES else None
 
 
 def normalize_output(
@@ -846,6 +1006,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("positive_dir", type=Path, help="Directory containing positive media and captions")
     parser.add_argument("negative_dir", type=Path, help="Directory in which paired negatives are written")
+    parser.add_argument(
+        "--mode",
+        "--generation-mode",
+        choices=GENERATION_MODES,
+        default="t2v",
+        help=(
+            "Generation conditioning: i2v uploads and injects each positive video's first frame; "
+            "image positives remain unconditioned"
+        ),
+    )
     parser.add_argument(
         "--workflow",
         type=Path,
@@ -1010,6 +1180,7 @@ def make_work_items(
 
 def run(args: argparse.Namespace) -> int:
     validate_args(args)
+    generation_mode = getattr(args, "mode", "t2v")
     workflow = load_api_workflow(args.workflow)
     apply_workflow_model_overrides(
         workflow,
@@ -1026,6 +1197,7 @@ def run(args: argparse.Namespace) -> int:
         prompt_node=args.prompt_node,
         shape_node=args.shape_node,
         output_node=args.output_node,
+        generation_mode=generation_mode,
     )
     media_paths = enumerate_media(args.positive_dir)
     if args.limit is not None:
@@ -1037,15 +1209,16 @@ def run(args: argparse.Namespace) -> int:
 
     print(
         f"Found {len(items)} positive(s); local H3 prompt node={binding.prompt_node}, "
-        f"shape node={binding.shape_node}, output node={binding.output_node}"
+        f"shape node={binding.shape_node}, output node={binding.output_node}, mode={generation_mode}"
     )
     for index, item in enumerate(items, start=1):
         audio = "+audio" if item.media.has_audio else "no audio"
+        item_mode = effective_generation_mode(generation_mode, item)
         print(
             f"[{index}/{len(items)}] {item.positive.name} -> {item.output.name}; "
             f"generate {item.generation_width}x{item.generation_height}x{item.generation_length}, "
             f"normalize {item.media.width}x{item.media.height}x{item.media.target_frames} ({audio}); "
-            f"seed={item.seed}\n  prompt: {item.generation_prompt}"
+            f"conditioning={item_mode}, seed={item.seed}\n  prompt: {item.generation_prompt}"
         )
     if args.dry_run:
         return 0
@@ -1059,27 +1232,55 @@ def run(args: argparse.Namespace) -> int:
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             manifest = {}
+    if not isinstance(manifest, dict):
+        manifest = {}
 
     completed = skipped = 0
     for index, item in enumerate(items, start=1):
+        item_mode = effective_generation_mode(generation_mode, item)
         if item.output.exists() and not args.overwrite:
             if not output_is_valid(item.output, item.media, args.ffprobe):
                 raise GenerationError(
                     f"Existing output is not a valid pair for {item.positive.name}: {item.output}. "
                     "Inspect it, then pass --overwrite to replace it."
                 )
+            recorded_mode = recorded_generation_mode(manifest.get(item.positive.name))
+            if recorded_mode != item_mode and (recorded_mode is not None or item_mode == "i2v"):
+                recorded_label = recorded_mode or "an unknown mode"
+                raise GenerationError(
+                    f"Existing output {item.output} was generated with {recorded_label}, but this run "
+                    f"requires {item_mode}. Pass --overwrite to regenerate it intentionally."
+                )
             print(f"[{index}/{len(items)}] Already valid, skipping {item.output.name}")
             skipped += 1
             continue
 
-        print(f"[{index}/{len(items)}] Queueing {item.positive.name} in local ComfyUI", flush=True)
-        prompt_workflow = prepare_workflow(workflow, binding, item)
-        prompt_id = client.queue(prompt_workflow)
-        history = client.wait(prompt_id)
-        resource = find_output_resource(history, binding.output_node)
-        suffix = Path(resource["filename"]).suffix or ".bin"
+        print(
+            f"[{index}/{len(items)}] Queueing {item.positive.name} in local ComfyUI ({item_mode})",
+            flush=True,
+        )
+        first_frame_sha256 = None
+        first_frame_comfy_input = None
         with tempfile.TemporaryDirectory(prefix="nsync-comfy-") as temp_directory:
-            downloaded = Path(temp_directory) / f"generated{suffix}"
+            temp_root = Path(temp_directory)
+            if item_mode == "i2v":
+                safe_stem = re.sub(r"[^A-Za-z0-9_.-]+", "_", item.positive.stem)
+                first_frame = temp_root / f"{safe_stem}_{item.seed}_first_frame.png"
+                extract_i2v_first_frame(item.media, first_frame, args.ffmpeg)
+                first_frame_sha256 = _sha256_file(first_frame)
+                first_frame_comfy_input = client.upload_image(first_frame, first_frame.name)
+
+            prompt_workflow = prepare_workflow(
+                workflow,
+                binding,
+                item,
+                first_frame_image=first_frame_comfy_input,
+            )
+            prompt_id = client.queue(prompt_workflow)
+            history = client.wait(prompt_id)
+            resource = find_output_resource(history, binding.output_node)
+            suffix = Path(resource["filename"]).suffix or ".bin"
+            downloaded = temp_root / f"generated{suffix}"
             client.download(resource, downloaded)
             normalize_output(downloaded, item.output, item.media, args.ffmpeg, args.ffprobe)
 
@@ -1087,6 +1288,8 @@ def run(args: argparse.Namespace) -> int:
             "output": item.output.name,
             "prompt": item.generation_prompt,
             "seed": item.seed,
+            "generation_mode": generation_mode,
+            "conditioning_mode": item_mode,
             "comfy_prompt_id": prompt_id,
             "positive_dimensions": [item.media.width, item.media.height],
             "positive_target_frames": item.media.target_frames,
@@ -1094,6 +1297,12 @@ def run(args: argparse.Namespace) -> int:
             "generation_dimensions": [item.generation_width, item.generation_height],
             "generation_length": item.generation_length,
         }
+        if first_frame_sha256 is not None:
+            manifest[item.positive.name]["first_frame"] = {
+                "source": item.positive.name,
+                "sha256": first_frame_sha256,
+                "comfy_input": first_frame_comfy_input,
+            }
         write_manifest(manifest_path, manifest)
         completed += 1
         print(f"[{index}/{len(items)}] Wrote {item.output}", flush=True)

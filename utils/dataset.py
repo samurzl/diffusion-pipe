@@ -25,7 +25,7 @@ from tqdm import tqdm
 
 from utils.common import is_main_process, VIDEO_EXTENSIONS, round_to_nearest_multiple
 from utils.cache import Cache
-from utils.nsync import NSYNC_POSITIVE, NSYNC_NEGATIVE, NSYNC_ANCHOR
+from utils.nsync import NSYNC_POSITIVE, NSYNC_NEGATIVE, NSYNC_ANCHOR, build_anchor_iteration_order
 import comfy.model_management as mm
 
 
@@ -328,7 +328,27 @@ class SizeBucketDataset:
                 caption = entry['caption']
 
         for ds, uncond_ds in zip(self.text_embedding_datasets, self.uncond_text_embeddings):
-            emb_dict = uncond_ds[0] if use_uncond else ds.get_text_embeddings(tuple(entry['image_spec']), entry['caption_number'])
+            example_embeddings = ds.get_text_embeddings(
+                tuple(entry['image_spec']), entry['caption_number']
+            )
+            if use_uncond:
+                # Multimodal encoders may need an example-specific unconditional
+                # presentation so image tokens stay paired with the same media.
+                # Such encoders cache those values under ``uncond_*`` keys. Keep
+                # the prefixed values as well: model-specific CFG training can
+                # consume them as a second branch later in prepare_inputs().
+                per_example_uncond = {
+                    key.removeprefix('uncond_'): value
+                    for key, value in example_embeddings.items()
+                    if key.startswith('uncond_')
+                }
+                if per_example_uncond:
+                    emb_dict = dict(example_embeddings)
+                    emb_dict.update(per_example_uncond)
+                else:
+                    emb_dict = uncond_ds[0]
+            else:
+                emb_dict = example_embeddings
             ret.update(emb_dict)
         ret['caption'] = caption
         return ret
@@ -405,14 +425,24 @@ class NSYNCBatchedDataset:
     ``PipelineDataLoader`` then splits it into those role-homogeneous pieces.
     """
 
-    def __init__(self, positive, negative, pair_name):
+    def __init__(self, positive, negative, pair_name, anchor_sources=None):
         if positive.size_bucket != negative.size_bucket:
             raise ValueError(f'NSYNC pair {pair_name!r} has mismatched size buckets')
         self.positive = positive
         self.negative = negative
         self.pair_name = pair_name
         self.size_bucket = positive.size_bucket
+        self.anchor_sources = [(pair_name, positive)] if anchor_sources is None else anchor_sources
+        if not self.anchor_sources:
+            raise ValueError(f'NSYNC pair {pair_name!r} has no anchor sources')
         self.post_init_called = False
+
+        for anchor_pair, anchor_dataset in self.anchor_sources:
+            if anchor_dataset.size_bucket != self.size_bucket:
+                raise ValueError(
+                    f'NSYNC pair {pair_name!r} cannot use anchor pair {anchor_pair!r}: '
+                    f'size bucket {anchor_dataset.size_bucket} does not match {self.size_bucket}'
+                )
 
         self.negative_lookup = {}
         for index, entry in enumerate(self.negative.iteration_order):
@@ -452,11 +482,11 @@ class NSYNCBatchedDataset:
 
         self.iteration_order = np.arange(len(self.positive))
         shuffle_with_seed(self.iteration_order, seed_from_hash(('nsync', self.pair_name, self.size_bucket)))
-        # The anchor is a second, independently shuffled draw from the positive
-        # distribution, rather than another view of the paired positive item.
-        self.anchor_iteration_order = np.arange(len(self.positive))
-        shuffle_with_seed(
-            self.anchor_iteration_order,
+        # Anchors are a second, independently shuffled draw from the configured
+        # positive distributions, rather than another view of the paired item.
+        self.anchor_iteration_order = build_anchor_iteration_order(
+            [len(anchor_dataset) for _, anchor_dataset in self.anchor_sources],
+            len(self.iteration_order),
             seed_from_hash(('nsync-anchor', self.pair_name, self.size_bucket)),
         )
         new_length = (len(self.iteration_order) // global_batch_size) * global_batch_size
@@ -491,16 +521,16 @@ class NSYNCBatchedDataset:
             micro_indices = positive_indices[offset:offset + self.micro_batch_size]
             micro_anchor_indices = anchor_indices[offset:offset + self.micro_batch_size]
             positives, negatives, anchors = [], [], []
-            for positive_index, anchor_index in zip(micro_indices, micro_anchor_indices):
+            for positive_index, anchor_location in zip(micro_indices, micro_anchor_indices):
                 positive_index = int(positive_index)
-                anchor_index = int(anchor_index)
+                anchor_source_index, anchor_index = anchor_location
                 positive_entry = self.positive.iteration_order[positive_index % base_positive_length]
                 key = self._entry_key(positive_entry)
                 negative_index = self.negative_lookup[key]
 
                 positive = self.positive[positive_index]
                 negative = self.negative[negative_index]
-                anchor = self.positive[anchor_index]
+                anchor = self.anchor_sources[anchor_source_index][1][anchor_index]
                 if positive['caption'] != negative['caption']:
                     raise ValueError(
                         f'NSYNC pair {self.pair_name!r} has different captions for {key}: '
@@ -1065,6 +1095,11 @@ class Dataset:
         self.directory_datasets = []
         nsync_roles_present = []
         for directory_config in dataset_config['directory']:
+            if (
+                'nsync_anchor_pairs' in directory_config
+                and directory_config.get('nsync_role') != 'positive'
+            ):
+                raise ValueError('nsync_anchor_pairs may only be set on a positive NSYNC directory')
             if 'nsync_role' in directory_config:
                 nsync_roles_present.append(directory_config['nsync_role'])
             directory_dataset = DirectoryDataset(
@@ -1096,10 +1131,24 @@ class Dataset:
         self.buckets = []
         if self.nsync_enabled:
             datasets_by_pair_and_bucket = defaultdict(lambda: defaultdict(list))
+            anchor_pairs_by_pair = {}
             for directory_dataset in self.directory_datasets:
                 directory_config = directory_dataset.directory_config
                 pair = directory_config.get('nsync_pair', 'default')
                 role = directory_config['nsync_role']
+                if role == 'positive':
+                    anchor_pairs = directory_config.get('nsync_anchor_pairs', [pair])
+                    if (
+                        not isinstance(anchor_pairs, list)
+                        or not anchor_pairs
+                        or not all(isinstance(anchor_pair, str) and anchor_pair for anchor_pair in anchor_pairs)
+                    ):
+                        raise ValueError(
+                            f'NSYNC pair {pair!r} nsync_anchor_pairs must be a non-empty list of group names'
+                        )
+                    if len(set(anchor_pairs)) != len(anchor_pairs):
+                        raise ValueError(f'NSYNC pair {pair!r} nsync_anchor_pairs contains duplicates')
+                    anchor_pairs_by_pair[pair] = anchor_pairs
                 for size_bucket_dataset in directory_dataset.get_size_bucket_datasets():
                     datasets_by_pair_and_bucket[(pair, tuple(size_bucket_dataset.size_bucket))][role].append(size_bucket_dataset)
 
@@ -1111,7 +1160,22 @@ class Dataset:
                         f'NSYNC pair {pair!r}, bucket {size_bucket} requires exactly one positive and one negative '
                         f'dataset, found {len(positives)} positive and {len(negatives)} negative'
                     )
-                bucket = NSYNCBatchedDataset(positives[0], negatives[0], pair)
+                anchor_sources = []
+                for anchor_pair in anchor_pairs_by_pair.get(pair, [pair]):
+                    anchor_roles = datasets_by_pair_and_bucket.get((anchor_pair, size_bucket), {})
+                    anchor_positives = anchor_roles.get('positive', [])
+                    if len(anchor_positives) != 1:
+                        raise ValueError(
+                            f'NSYNC pair {pair!r}, bucket {size_bucket} requires exactly one positive '
+                            f'anchor dataset from pair {anchor_pair!r}, found {len(anchor_positives)}'
+                        )
+                    anchor_sources.append((anchor_pair, anchor_positives[0]))
+                bucket = NSYNCBatchedDataset(
+                    positives[0],
+                    negatives[0],
+                    pair,
+                    anchor_sources=anchor_sources,
+                )
                 batch_size_dict = global_batch_size_image if size_bucket[-1] == 1 else global_batch_size
                 if None in batch_size_dict:
                     bucket_global_batch_size = batch_size_dict[None]
@@ -1307,15 +1371,12 @@ def _cache_fn(
             media = None
             if te_fn_requires_media[text_encoder_idx]:
                 media = []
-                for image_spec, mask_path, size_bucket, is_video in zip(
-                    example['image_spec'],
-                    example['mask_file'],
-                    example['size_bucket'],
-                    example['is_video'],
-                ):
+                for index, is_video in enumerate(example['is_video']):
                     if not is_video:
                         media.append(None)
                         continue
+                    image_spec = example['image_spec'][index]
+                    size_bucket = example['size_bucket'][index]
                     # Some multimodal text encoders need the first frame in
                     # the exact crop/resize used for the corresponding latent.
                     # This is deliberately done only for models that request

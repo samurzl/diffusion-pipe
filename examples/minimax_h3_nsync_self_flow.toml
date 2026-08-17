@@ -33,6 +33,10 @@ compile = false
 
 [model]
 type = 'minimax_h3'
+# For first-frame training, set mode = 'i2v', generate negatives with
+# --mode i2v, and use examples/minimax_h3_i2v_nsync_dataset.toml.
+#mode = 'i2v'
+#i2v_visual_cond_timestep = 0.999
 diffusion_model = '/path/to/minimax_h3_fl2va_pruned_int8_convrot.safetensors'
 vae = '/path/to/minimax_h3_video_vae_fp16.safetensors'
 audio_vae = '/path/to/minimax_h3_audio_vae_fp32.safetensors'

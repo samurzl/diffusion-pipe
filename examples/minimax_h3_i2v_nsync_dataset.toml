@@ -1,0 +1,31 @@
+# Mixed image/video paired dataset for MiniMax H3 mode = 'i2v' with NSYNC.
+# Videos receive first-frame conditioning; images remain text-conditioned.
+# Generate the negative directory with:
+# python tools/generate_minimax_h3_nsync_negatives.py \
+#   /path/to/target_positive_media /path/to/generated_negative_media \
+#   --mode i2v --remove-text 'your target trigger or style'
+
+resolutions = [512]
+enable_ar_bucket = true
+min_ar = 0.5
+max_ar = 2.0
+num_ar_buckets = 9
+
+# Frame bucket 1 enables images. H3's video VAE works in chunks of 17 frames.
+# Both sides of every pair must have the same stem and bucket configuration.
+frame_buckets = [1, 34, 68, 102, 136]
+
+[[directory]]
+path = '/path/to/target_positive_media'
+num_repeats = 1
+nsync_role = 'positive'
+nsync_pair = 'target_style_i2v'
+
+[[directory]]
+path = '/path/to/generated_negative_media'
+# NSYNC requires the exact positive training caption on both sides. The cleaned
+# prompt used to generate the negative is intentionally not a training caption.
+caption_path = '/path/to/target_positive_media'
+num_repeats = 1
+nsync_role = 'negative'
+nsync_pair = 'target_style_i2v'

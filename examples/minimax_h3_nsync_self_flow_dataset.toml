@@ -10,6 +10,8 @@
 #   /path/to/target_positive_media /path/to/generated_negative_media \
 #   --workflow /path/to/minimax_h3_t2va_api.json \
 #   --remove-text 'your target trigger or style' --dry-run
+# Add --mode i2v when training with model.mode = 'i2v'. The mixed image/video
+# I2V setup is shown in minimax_h3_i2v_nsync_dataset.toml.
 
 resolutions = [512]
 enable_ar_bucket = true
@@ -23,6 +25,9 @@ path = '/path/to/target_positive_media'
 num_repeats = 1
 nsync_role = 'positive'
 nsync_pair = 'target_style'
+# Optional: draw anchors from the positives of other configured NSYNC groups.
+# Every named group must have the same bucket settings as this group.
+# nsync_anchor_pairs = ['other_target', 'general_data']
 
 [[directory]]
 path = '/path/to/generated_negative_media'

@@ -197,6 +197,7 @@ DATASET_KEYS = {
     'mask_path',
     'max_ar',
     'min_ar',
+    'nsync_anchor_pairs',
     'nsync_pair',
     'nsync_role',
     'num_ar_buckets',
@@ -216,6 +217,7 @@ DATASET_ROOT_KEYS = DATASET_KEYS - {
     'control_path',
     'default_mask_file',
     'mask_path',
+    'nsync_anchor_pairs',
     'nsync_pair',
     'nsync_role',
     'path',
@@ -1402,6 +1404,7 @@ def _validate_dataset_config(
 
     nsync_roles: list[str | None] = []
     nsync_pairs: dict[str, dict[str, int]] = {}
+    nsync_anchor_pairs: dict[str, list[str]] = {}
     nsync_summaries: dict[str, dict[str, dict[str, Any]]] = {}
     for index, directory in enumerate(directories):
         prefix = f'{description}.directory[{index}]'
@@ -1582,11 +1585,11 @@ def _validate_dataset_config(
                 )
 
         role = directory.get('nsync_role')
+        pair = directory.get('nsync_pair', 'default')
         nsync_roles.append(role)
         if role is not None:
             if role not in ('positive', 'negative'):
                 errors.append(f'{prefix}.nsync_role must be positive or negative, got {role!r}')
-            pair = directory.get('nsync_pair', 'default')
             if not isinstance(pair, str) or not pair:
                 errors.append(f'{prefix}.nsync_pair must be a non-empty string')
             else:
@@ -1621,6 +1624,19 @@ def _validate_dataset_config(
                         ),
                     }
                     nsync_summaries.setdefault(pair, {})[role] = summary
+
+        anchor_pairs = directory.get('nsync_anchor_pairs')
+        if anchor_pairs is not None:
+            if role != 'positive':
+                errors.append(f'{prefix}.nsync_anchor_pairs may only be set on a positive directory')
+            if not isinstance(anchor_pairs, list) or not anchor_pairs:
+                errors.append(f'{prefix}.nsync_anchor_pairs must be a non-empty list of group names')
+            elif not all(isinstance(anchor_pair, str) and anchor_pair for anchor_pair in anchor_pairs):
+                errors.append(f'{prefix}.nsync_anchor_pairs must contain only non-empty strings')
+            elif len(set(anchor_pairs)) != len(anchor_pairs):
+                errors.append(f'{prefix}.nsync_anchor_pairs must not contain duplicate group names')
+            elif role == 'positive' and isinstance(pair, str) and pair:
+                nsync_anchor_pairs[pair] = anchor_pairs
 
     has_nsync_roles = any(role is not None for role in nsync_roles)
     if has_nsync_roles and any(role is None for role in nsync_roles):
@@ -1676,6 +1692,22 @@ def _validate_dataset_config(
                     f'{description}: NSYNC pair {pair!r} has different caption counts for {stem!r}: '
                     f'{positive_count} positive and {negative_count} negative'
                 )
+
+    for pair, anchor_pairs in nsync_anchor_pairs.items():
+        target_summary = nsync_summaries.get(pair, {}).get('positive')
+        for anchor_pair in anchor_pairs:
+            if anchor_pair not in nsync_pairs:
+                errors.append(
+                    f'{description}: NSYNC pair {pair!r} references unknown anchor pair {anchor_pair!r}'
+                )
+                continue
+            anchor_summary = nsync_summaries.get(anchor_pair, {}).get('positive')
+            if target_summary is not None and anchor_summary is not None:
+                if target_summary['shape_config'] != anchor_summary['shape_config']:
+                    errors.append(
+                        f'{description}: NSYNC pair {pair!r} and anchor pair {anchor_pair!r} '
+                        'have mismatched bucket configuration'
+                    )
 
     if model_type == 'cosmos' and not skip_dataset_validation:
         # Cosmos only supports its fixed, explicit size buckets. The model performs
