@@ -1,8 +1,8 @@
 # Generating MiniMax H3 NSYNC negatives with local ComfyUI
 
-[`tools/generate_minimax_h3_nsync_negatives.py`](../tools/generate_minimax_h3_nsync_negatives.py) builds the paired generated-negative directory required by MiniMax H3 NSYNC training. ComfyUI runs the local MiniMax H3 model as the inference backend; the script only uses ComfyUI's local HTTP queue, history, and file endpoints. A ready API-format graph is included at [`examples/minimax_h3_t2va_api.json`](../examples/minimax_h3_t2va_api.json); it uses the LightX2V four-step Turbo LoRA, and the RunPod bootstrap patches its loader filenames to the model variants it finds in the existing ComfyUI.
+[`tools/generate_minimax_h3_nsync_negatives.py`](../tools/generate_minimax_h3_nsync_negatives.py) builds the paired generated-negative directory required by MiniMax H3 NSYNC training. ComfyUI runs the local MiniMax H3 model as the inference backend; the script only uses ComfyUI's local HTTP queue, history, and file endpoints. A ready API-format graph is included at [`examples/minimax_h3_t2va_api.json`](../examples/minimax_h3_t2va_api.json); it uses the LightX2V four-step Turbo LoRA. The repository does not install ComfyUI or download models: prepare those manually before running the generator.
 
-If you are starting with an empty GPU instance, use the [fresh RunPod MiniMax H3 NSYNC + Self-Flow guide](minimax_h3_nsync_self_flow_runpod.md) for the Pod template, installation, model downloads, ComfyUI setup, negative generation, caching, and training commands in one sequence.
+If you are starting with an empty GPU instance, use the [manual RunPod MiniMax H3 NSYNC + Self-Flow guide](minimax_h3_nsync_self_flow_runpod.md) for the Pod template, installation, model downloads, ComfyUI setup, negative generation, caching, and training commands in one sequence.
 
 The script never calls the hosted MiniMax service. It rejects workflows containing ComfyUI MiniMax partner/API nodes such as `MinimaxHailuo03TextToVideoNode`.
 
@@ -43,19 +43,35 @@ ffmpeg -version
 ffprobe -version
 ```
 
-## Use or customize the local ComfyUI workflow
+## Set up the local ComfyUI workflow manually
 
-For the standard setup, use the bundled workflow directly:
+Install or update ComfyUI using its normal installation method, then place the files where its loaders can see them:
 
-```bash
-export H3_WORKFLOW_API=/workspace/workflows/minimax_h3_t2va_api.json
+```text
+ComfyUI/models/
+├── diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors
+├── text_encoders/qwen3vl_32b_minimax_h3_int8_convrot.safetensors
+├── vae/minimax_h3_video_vae_fp16.safetensors
+├── vae/minimax_h3_audio_vae_fp32.safetensors
+└── loras/minimax_h3_fl2v_turbo_4step_v1.0_768p_comfyui_bf16.safetensors
 ```
 
-The RunPod setup script creates that runtime copy with the correct ComfyUI loader filenames. If using the standard model filenames without the bootstrap, use `examples/minimax_h3_t2va_api.json` directly. The bundled defaults are 736×416 (approximately 0.3 MP), 56 frames on H3's `17n+5` grid (approximately 2.33 seconds at 24 fps), Euler, six sampling steps, LoRA strength 1.0, and LightX2V's required video/audio sigma shifts of 6/3. The generator replaces the canvas and frame request per positive so paired negatives still match their sources. Continue to [Prepare the positive directory](#prepare-the-positive-directory) unless you need to customize sampling.
+Start ComfyUI yourself and verify its local API before continuing:
 
-### Run directly without the bootstrap
+```bash
+cd /path/to/ComfyUI
+python main.py --listen 127.0.0.1 --port 8188
+```
 
-The generator uses the tracked [`examples/minimax_h3_t2va_api.json`](../examples/minimax_h3_t2va_api.json) automatically when `--workflow` is omitted. If your ComfyUI model files use the workflow's standard filenames, you do not need any setup-generated environment variables or model arguments:
+```bash
+curl --fail http://127.0.0.1:8188/system_stats
+```
+
+The bundled workflow's defaults are 736×416 (approximately 0.3 MP), 56 frames on H3's `17n+5` grid (approximately 2.33 seconds at 24 fps), Euler, six sampling steps, LoRA strength 1.0, and LightX2V's required video/audio sigma shifts of 6/3. The generator replaces the canvas and frame request per positive so paired negatives still match their sources.
+
+### Use the bundled API workflow
+
+The generator uses the tracked [`examples/minimax_h3_t2va_api.json`](../examples/minimax_h3_t2va_api.json) when `--workflow` is omitted. If your ComfyUI model files use the standard filenames shown above, no model arguments are needed:
 
 ```bash
 cd /workspace/diffusion-pipe
@@ -67,7 +83,7 @@ python tools/generate_minimax_h3_nsync_negatives.py \
   --generation-megapixels 0.3
 ```
 
-When your files have different names, pass either their loader names exactly as ComfyUI displays them, or their absolute paths together with `--comfy-root`. This complete example does not run or depend on the bootstrap:
+When your files have different names, pass either their loader names exactly as ComfyUI displays them, or their absolute paths together with `--comfy-root`:
 
 ```bash
 cd /workspace/diffusion-pipe

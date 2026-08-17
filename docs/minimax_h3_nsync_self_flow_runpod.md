@@ -1,4 +1,4 @@
-# Fresh RunPod setup for MiniMax H3 LoRA training with NSYNC and Self-Flow
+# Manual RunPod setup for MiniMax H3 LoRA training with NSYNC and Self-Flow
 
 This guide starts with an empty RunPod Pod and ends with a single-GPU MiniMax H3 LoRA training run that has:
 
@@ -66,84 +66,6 @@ Check the persistent mount:
 ```bash
 df -h /workspace
 ```
-
-## Automated installation on an existing ComfyUI volume
-
-If the Network Volume already contains ComfyUI and the H3 models, use [`tools/setup_runpod_minimax_h3.sh`](../tools/setup_runpod_minimax_h3.sh). The script:
-
-- finds an existing ComfyUI under `/workspace`, or accepts its path through `--comfy-root`;
-- uses the H3 checkpoints and LightX2V Turbo LoRA directly from that installation's `models` folders;
-- does **not** download, copy, symlink, upgrade, or otherwise modify ComfyUI or its models;
-- creates a version-specific diffusion-pipe venv on the Network Volume;
-- skips `pip` on later Pods when that venv is current and passes its import/CUDA check;
-- installs only missing container-level tools on each new Pod;
-- initializes diffusion-pipe's pinned ComfyUI **code submodule**, which its trainer imports independently of the existing ComfyUI application; and
-- writes a ready-to-queue workflow at `/workspace/workflows/minimax_h3_t2va_api.json`, patched to the five model filenames it discovered; and
-- writes `/workspace/minimax-h3-env.sh` with the workflow path, discovered model paths, and environment activation.
-
-On the first Pod attached to the volume, install Git and clone diffusion-pipe if it is not already present:
-
-```bash
-apt-get update
-DEBIAN_FRONTEND=noninteractive apt-get install -y git curl
-```
-
-```bash
-if [[ ! -d /workspace/diffusion-pipe/.git ]]; then
-  git clone --recurse-submodules https://github.com/samurzl/diffusion-pipe.git /workspace/diffusion-pipe
-fi
-```
-
-The ready workflow requires LightX2V's current four-step v1.0 ComfyUI LoRA. If it is not already in the existing installation, download it once to that installation's `models/loras` folder. Replace `/workspace/ComfyUI` here and in the bootstrap command when your installation lives elsewhere:
-
-```bash
-mkdir -p /workspace/ComfyUI/models/loras
-if [[ ! -s /workspace/ComfyUI/models/loras/minimax_h3_fl2v_turbo_4step_v1.0_768p_comfyui_bf16.safetensors ]]; then
-  curl --fail --location --retry 5 --continue-at - \
-    --output /workspace/ComfyUI/models/loras/.minimax_h3_fl2v_turbo_4step_v1.0_768p_comfyui_bf16.safetensors.partial \
-    https://huggingface.co/lightx2v/Minimax-h3-Turbo/resolve/main/minimax_h3_fl2v_turbo_4step_v1.0_768p_comfyui_bf16.safetensors \
-  && mv \
-    /workspace/ComfyUI/models/loras/.minimax_h3_fl2v_turbo_4step_v1.0_768p_comfyui_bf16.safetensors.partial \
-    /workspace/ComfyUI/models/loras/minimax_h3_fl2v_turbo_4step_v1.0_768p_comfyui_bf16.safetensors
-fi
-```
-
-Run the bootstrap. Replace `/workspace/ComfyUI` if your existing installation is elsewhere; omit `--comfy-root` to let the script search common `/workspace` locations:
-
-```bash
-bash /workspace/diffusion-pipe/tools/setup_runpod_minimax_h3.sh \
-  --comfy-root /workspace/ComfyUI
-```
-
-Activate the generated environment in the current shell:
-
-```bash
-source /workspace/minimax-h3-env.sh
-```
-
-Confirm which existing files it selected:
-
-```bash
-printf 'ComfyUI: %s\nDiffusion model: %s\nText encoder: %s\nVideo VAE: %s\nAudio VAE: %s\nTurbo LoRA: %s\nTraining venv: %s\n' \
-  "$COMFYUI_ROOT" "$H3_DIFFUSION_MODEL" "$H3_TEXT_ENCODER" \
-  "$H3_VIDEO_VAE" "$H3_AUDIO_VAE" "$H3_TURBO_LORA" "$DP_VENV"
-```
-
-On every later Pod using the **same Network Volume and the same PyTorch template**, the fast path is just:
-
-```bash
-bash /workspace/diffusion-pipe/tools/setup_runpod_minimax_h3.sh \
-  --comfy-root /workspace/ComfyUI
-source /workspace/minimax-h3-env.sh
-```
-
-The script supports alternate model paths, a nonstandard ComfyUI Python, forced dependency refreshes, and a recoverable venv rebuild. See every option with:
-
-```bash
-bash /workspace/diffusion-pipe/tools/setup_runpod_minimax_h3.sh --help
-```
-
-After the automated setup succeeds, skip the manual installation and model-download steps 3 through 5 and continue at step 6. The manual steps remain below for volumes that do not already contain ComfyUI and the H3 weights.
 
 ## 3. Install system tools and clone diffusion-pipe
 
@@ -374,10 +296,10 @@ Do not put two media files with the same stem in the positive directory. For exa
 
 ## 7. Start the repository's local ComfyUI
 
-Create persistent workflow, output, and log directories:
+Create persistent output and log directories:
 
 ```bash
-mkdir -p /workspace/workflows /workspace/comfy-output /workspace/logs
+mkdir -p /workspace/comfy-output /workspace/logs
 ```
 
 Start ComfyUI in a detached `tmux` session:
@@ -391,7 +313,7 @@ else
 fi
 ```
 
-The automated setup prefers the existing ComfyUI `.venv` or `venv` for `COMFYUI_PYTHON`. If your installation has a custom launcher or another environment, start it normally or rerun setup with `--comfy-python /path/to/python`.
+This guide runs the pinned ComfyUI submodule with the diffusion-pipe virtual environment. If you use a separate ComfyUI installation or virtual environment, set `COMFYUI_ROOT` and `COMFYUI_PYTHON` to those paths before running the command.
 
 Watch startup:
 
@@ -411,7 +333,7 @@ In RunPod, open **Connect > HTTP Service [Port 8188]**.
 
 The repository includes [`examples/minimax_h3_t2va_api.json`](../examples/minimax_h3_t2va_api.json). It is already in ComfyUI API format and contains local text-only H3 conditioning, LightX2V's four-step v1.0 Turbo LoRA at strength 1.0, its required 6/3 video/audio sigma shift, Euler with six sampling steps, video and audio decoding, 24 fps muxing, and exactly one `SaveVideo` output. Its defaults are 736×416 (approximately 0.3 MP) and 56 frames (approximately 2.33 seconds, because H3 snaps a two-second request upward to its `17n+5` frame grid). It has no first-frame, last-frame, reference, or hosted MiniMax API connections.
 
-The automated setup writes a copy to `$H3_WORKFLOW_API` and changes its five loader filenames to the precise model variants found in the existing ComfyUI. Confirm it is ready:
+`H3_WORKFLOW_API` points directly at the tracked workflow. The standard filenames downloaded in step 5 match its loader inputs. Confirm the graph is ready:
 
 ```bash
 test -s "$H3_WORKFLOW_API" \
@@ -423,7 +345,7 @@ No manual ComfyUI export is needed. The generator changes the prompt, width, hei
 
 Mixed image/video datasets are handled per file. Image positives produce same-stem one-frame `.png` negatives; H3 generates its minimum five-frame latent internally and the utility extracts one frame. Video positives produce `.mp4` negatives normalized to the positive video's dimensions, duration, frame count, and audio presence.
 
-If you skipped the bootstrap, omit `--workflow` to use the tracked ready graph and pass the five model files through the generator's manual loader arguments. The [direct-without-bootstrap command](minimax_h3_nsync_negative_generation.md#run-directly-without-the-bootstrap) shows both the standard-filename and fully explicit forms.
+You may omit `--workflow` because the generator defaults to this tracked graph. If your ComfyUI loader names differ from step 5, pass the five model files through the generator's explicit model arguments. The [manual ComfyUI workflow guide](minimax_h3_nsync_negative_generation.md#set-up-the-local-comfyui-workflow-manually) shows both the standard-filename and fully explicit forms.
 
 ## 8. Generate the NSYNC negatives automatically
 
@@ -735,7 +657,7 @@ Restart ComfyUI and inspect `/workspace/logs/comfy.log`.
 
 ### ComfyUI does not list the model files
 
-Check the model paths discovered by the setup:
+Check the model paths configured in step 3:
 
 ```bash
 printf '%s\n' "$H3_DIFFUSION_MODEL" "$H3_TEXT_ENCODER" "$H3_VIDEO_VAE" "$H3_AUDIO_VAE"
@@ -763,7 +685,7 @@ Do not lower the video microbatch below 1.
 
 ### The generator rejects the workflow as UI format
 
-Re-source `/workspace/minimax-h3-env.sh` and confirm that `H3_WORKFLOW_API` points to the runtime copy written by the bootstrap. The bundled workflow is already in API format. If you substituted a custom graph, enable developer-mode options in ComfyUI and export **Save (API Format)**; a normal UI workflow cannot be passed directly to `--workflow`.
+Confirm that `H3_WORKFLOW_API` points to `examples/minimax_h3_t2va_api.json`; the bundled workflow is already in API format. If you substituted a custom graph, enable developer-mode options in ComfyUI and export **Save (API Format)**; a normal UI workflow cannot be passed directly to `--workflow`.
 
 ### The generator says the positive has audio but the output does not
 
