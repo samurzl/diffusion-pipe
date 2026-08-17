@@ -25,7 +25,13 @@ from tqdm import tqdm
 
 from utils.common import is_main_process, VIDEO_EXTENSIONS, round_to_nearest_multiple
 from utils.cache import Cache
-from utils.nsync import NSYNC_POSITIVE, NSYNC_NEGATIVE, NSYNC_ANCHOR, build_anchor_iteration_order
+from utils.nsync import (
+    NSYNC_POSITIVE,
+    NSYNC_NEGATIVE,
+    NSYNC_ANCHOR,
+    build_anchor_iteration_order,
+    build_unbucketed_nsync_role_order,
+)
 import comfy.model_management as mm
 
 
@@ -599,6 +605,66 @@ class NSYNCBatchedDataset:
             examples.extend(negatives)
             examples.extend(anchors)
         return examples
+
+
+class UnbucketedNSYNCBatchedDataset(NSYNCBatchedDataset):
+    """Return one independently shaped NSYNC role sample per physical batch."""
+
+    def post_init(self, data_parallel_rank, data_parallel_world_size):
+        if data_parallel_world_size != 1:
+            raise ValueError('Unbucketed NSYNC requires data parallel world size 1')
+        self.data_parallel_rank = data_parallel_rank
+        self.data_parallel_world_size = data_parallel_world_size
+        self.iteration_order = np.arange(len(self.positive))
+        shuffle_with_seed(
+            self.iteration_order,
+            seed_from_hash(('nsync-unbucketed', self.pair_name)),
+        )
+        self.anchor_iteration_order = build_anchor_iteration_order(
+            [len(anchor_dataset) for _, anchor_dataset in self.anchor_sources],
+            len(self.iteration_order),
+            seed_from_hash(('nsync-anchor-unbucketed', self.pair_name)),
+        )
+        self.post_init_called = True
+
+    def __len__(self):
+        assert self.post_init_called
+        return len(self.iteration_order) * 3
+
+    @staticmethod
+    def _entry_caption(dataset, entry):
+        if getattr(dataset, 'captions_dict', None):
+            key = entry['image_spec'][-1]
+            if key in dataset.captions_dict:
+                return dataset.captions_dict[key][entry['caption_number']]
+            return ''
+        return entry['caption']
+
+    def __getitem__(self, idx):
+        assert self.post_init_called
+        occurrence_index, role_offset = divmod(idx, 3)
+        positive_index = int(self.iteration_order[occurrence_index])
+
+        if role_offset == NSYNC_POSITIVE:
+            return [self._with_role(self.positive[positive_index], NSYNC_POSITIVE)]
+
+        if role_offset == NSYNC_NEGATIVE:
+            base_positive_length = len(self.positive.iteration_order)
+            positive_entry = self.positive.iteration_order[positive_index % base_positive_length]
+            key = self._entry_key(positive_entry)
+            negative_index = self.negative_lookup[key]
+            negative = self.negative[negative_index]
+            positive_caption = self._entry_caption(self.positive, positive_entry)
+            if positive_caption != negative['caption']:
+                raise ValueError(
+                    f'NSYNC pair {self.pair_name!r} has different captions for {key}: '
+                    f'{positive_caption!r} != {negative["caption"]!r}'
+                )
+            return [self._with_role(negative, NSYNC_NEGATIVE)]
+
+        anchor_source_index, anchor_index = self.anchor_iteration_order[occurrence_index]
+        anchor = self.anchor_sources[anchor_source_index][1][anchor_index]
+        return [self._with_role(anchor, NSYNC_ANCHOR)]
 
 
 class ARBucketDataset:
@@ -1221,8 +1287,6 @@ class Dataset:
             )
             self.directory_datasets.append(directory_dataset)
         self.nsync_enabled = len(nsync_roles_present) > 0
-        if self.unbucketed and self.nsync_enabled:
-            raise ValueError('unbucketed=true is not compatible with NSYNC')
         if self.nsync_enabled:
             if not getattr(model, 'nsync_enabled', False):
                 raise ValueError('Dataset contains nsync_role entries, but NSYNC is not enabled in the training config')
@@ -1245,18 +1309,66 @@ class Dataset:
                 raise ValueError('unbucketed=true requires micro_batch_size_per_gpu=1')
             if any(batch_size != 1 for batch_size in per_device_batch_size_image.values()):
                 raise ValueError('unbucketed=true requires image_micro_batch_size_per_gpu=1')
-            native_datasets = [
-                size_bucket_dataset
-                for directory_dataset in self.directory_datasets
-                for size_bucket_dataset in directory_dataset.get_size_bucket_datasets()
-            ]
-            bucket = UnbucketedBatchedDataset(native_datasets)
-            bucket.post_init(
-                data_parallel_rank,
-                data_parallel_world_size,
-                gradient_accumulation_steps,
-            )
-            self.buckets.append(bucket)
+            if self.nsync_enabled:
+                datasets_by_pair = defaultdict(lambda: defaultdict(list))
+                anchor_pairs_by_pair = {}
+                for directory_dataset in self.directory_datasets:
+                    directory_config = directory_dataset.directory_config
+                    pair = directory_config.get('nsync_pair', 'default')
+                    role = directory_config['nsync_role']
+                    if role == 'positive':
+                        anchor_pairs = directory_config.get('nsync_anchor_pairs', [pair])
+                        if (
+                            not isinstance(anchor_pairs, list)
+                            or not anchor_pairs
+                            or not all(isinstance(anchor_pair, str) and anchor_pair for anchor_pair in anchor_pairs)
+                        ):
+                            raise ValueError(
+                                f'NSYNC pair {pair!r} nsync_anchor_pairs must be a non-empty list of group names'
+                            )
+                        if len(set(anchor_pairs)) != len(anchor_pairs):
+                            raise ValueError(f'NSYNC pair {pair!r} nsync_anchor_pairs contains duplicates')
+                        anchor_pairs_by_pair[pair] = anchor_pairs
+                    datasets_by_pair[pair][role].extend(directory_dataset.get_size_bucket_datasets())
+
+                for pair, role_datasets in datasets_by_pair.items():
+                    positives = role_datasets.get('positive', [])
+                    negatives = role_datasets.get('negative', [])
+                    if len(positives) != 1 or len(negatives) != 1:
+                        raise ValueError(
+                            f'Unbucketed NSYNC pair {pair!r} requires exactly one positive and one negative '
+                            f'dataset, found {len(positives)} positive and {len(negatives)} negative'
+                        )
+                    anchor_sources = []
+                    for anchor_pair in anchor_pairs_by_pair.get(pair, [pair]):
+                        anchor_positives = datasets_by_pair.get(anchor_pair, {}).get('positive', [])
+                        if len(anchor_positives) != 1:
+                            raise ValueError(
+                                f'Unbucketed NSYNC pair {pair!r} requires exactly one positive '
+                                f'anchor dataset from pair {anchor_pair!r}, found {len(anchor_positives)}'
+                            )
+                        anchor_sources.append((anchor_pair, anchor_positives[0]))
+                    bucket = UnbucketedNSYNCBatchedDataset(
+                        positives[0],
+                        negatives[0],
+                        pair,
+                        anchor_sources=anchor_sources,
+                    )
+                    bucket.post_init(data_parallel_rank, data_parallel_world_size)
+                    self.buckets.append(bucket)
+            else:
+                native_datasets = [
+                    size_bucket_dataset
+                    for directory_dataset in self.directory_datasets
+                    for size_bucket_dataset in directory_dataset.get_size_bucket_datasets()
+                ]
+                bucket = UnbucketedBatchedDataset(native_datasets)
+                bucket.post_init(
+                    data_parallel_rank,
+                    data_parallel_world_size,
+                    gradient_accumulation_steps,
+                )
+                self.buckets.append(bucket)
         elif self.nsync_enabled:
             datasets_by_pair_and_bucket = defaultdict(lambda: defaultdict(list))
             anchor_pairs_by_pair = {}
@@ -1330,15 +1442,34 @@ class Dataset:
             for bucket in self.buckets:
                 bucket.post_init(global_batch_size, global_batch_size_image, data_parallel_rank, data_parallel_world_size)
 
-        iteration_order = []
-        for i, bucket in enumerate(self.buckets):
-            iteration_order.extend([i]*(len(bucket)))
-        shuffle_with_seed(iteration_order, 0)
-        cumulative_sums = [0] * len(self.buckets)
-        for k, dataset_idx in enumerate(iteration_order):
-            iteration_order[k] = (dataset_idx, cumulative_sums[dataset_idx])
-            cumulative_sums[dataset_idx] += 1
-        self.iteration_order = iteration_order
+        if self.unbucketed and self.nsync_enabled:
+            # Shuffle whole positive/negative/anchor triplets, then flatten them
+            # back into the exact role order expected by the gradient controller.
+            pair_lengths = []
+            for bucket in self.buckets:
+                if len(bucket) % 3 != 0:
+                    raise RuntimeError('Unbucketed NSYNC role sequence was not divisible into triplets')
+                pair_lengths.append(len(bucket) // 3)
+            logical_batch_size = gradient_accumulation_steps * data_parallel_world_size
+            self.iteration_order = build_unbucketed_nsync_role_order(
+                pair_lengths,
+                logical_batch_size,
+            )
+            if not self.iteration_order and is_main_process():
+                logger.warning(
+                    'The unbucketed NSYNC dataset is being completely dropped because it does not '
+                    'contain one complete logical batch across all configured groups'
+                )
+        else:
+            iteration_order = []
+            for i, bucket in enumerate(self.buckets):
+                iteration_order.extend([i]*(len(bucket)))
+            shuffle_with_seed(iteration_order, 0)
+            cumulative_sums = [0] * len(self.buckets)
+            for k, dataset_idx in enumerate(iteration_order):
+                iteration_order[k] = (dataset_idx, cumulative_sums[dataset_idx])
+                cumulative_sums[dataset_idx] += 1
+            self.iteration_order = iteration_order
         if DEBUG:
             print(f'Dataset iteration_order: {self.iteration_order}')
 
@@ -1347,7 +1478,8 @@ class Dataset:
         if subsample_ratio := self.dataset_config.get('subsample_ratio', None):
             new_len = int(len(self) * subsample_ratio)
             if self.unbucketed:
-                new_len = (new_len // gradient_accumulation_steps) * gradient_accumulation_steps
+                accumulation_size = gradient_accumulation_steps * (3 if self.nsync_enabled else 1)
+                new_len = (new_len // accumulation_size) * accumulation_size
             self.iteration_order = self.iteration_order[:new_len]
 
     def set_eval_quantile(self, quantile):

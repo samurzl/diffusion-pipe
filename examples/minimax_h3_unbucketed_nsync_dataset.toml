@@ -1,0 +1,37 @@
+# Unbucketed NSYNC for small MiniMax H3 datasets. Each role is prepared as an
+# independent physical batch, so positives, negatives, and anchors do not need
+# to share a tensor shape. All directories still use the same target pixel area.
+# Set both micro_batch_size_per_gpu and image_micro_batch_size_per_gpu to 1 in
+# the training config. NSYNC also requires data-parallel world size 1.
+unbucketed = true
+resolutions = [512]
+
+# Target group. Its anchors are drawn from the general group's positives.
+[[directory]]
+path = '/path/to/target_positive_media'
+num_repeats = 1
+nsync_role = 'positive'
+nsync_pair = 'target'
+nsync_anchor_pairs = ['general']
+
+[[directory]]
+path = '/path/to/target_negative_media'
+caption_path = '/path/to/target_positive_media'
+num_repeats = 1
+nsync_role = 'negative'
+nsync_pair = 'target'
+
+# General anchor group. Every NSYNC group still needs its own matching negative
+# directory even when another group uses only its positives as anchors.
+[[directory]]
+path = '/path/to/general_positive_media'
+num_repeats = 1
+nsync_role = 'positive'
+nsync_pair = 'general'
+
+[[directory]]
+path = '/path/to/general_negative_media'
+caption_path = '/path/to/general_positive_media'
+num_repeats = 1
+nsync_role = 'negative'
+nsync_pair = 'general'

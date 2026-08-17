@@ -14,7 +14,7 @@ Models supported: SDXL, Flux, LTX-Video, HunyuanVideo (t2v), Cosmos, Lumina Imag
 
 ## Recent changes
 - 2026-08-17
-  - Add an unbucketed dataset mode for small MiniMax H3 LoRA datasets that preserves native aspect ratios and frame lengths using physical batch size one.
+  - Add an unbucketed dataset mode for small MiniMax H3 LoRA datasets that preserves native aspect ratios and frame lengths using physical batch size one, including NSYNC training with independently shaped roles.
   - Add MiniMax H3 I2V training with first-frame VAE/Qwen conditioning, including NSYNC role batches and I2V negative generation.
 - 2026-08-10
   - Add NSYNC and Self-Flow LoRA training for MiniMax H3, including combined NSYNC + Self-Flow runs for joint video/audio training.

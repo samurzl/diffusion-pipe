@@ -48,7 +48,9 @@ Last-frame and general reference-to-video training are not implemented.
 
 When a small dataset cannot populate useful aspect-ratio and frame buckets, use [`minimax_h3_unbucketed_dataset.toml`](../examples/minimax_h3_unbucketed_dataset.toml). Set `unbucketed = true` and exactly one `resolutions` entry at the dataset root, then remove the aspect-ratio, frame-bucket, and explicit size-bucket settings. Each sample is scaled to approximately `resolution²` pixels while retaining its native aspect ratio and usable frame length. Samples are shuffled and trained one at a time, so a sparse shape cannot cause that sample to be dropped. H3's required alignment still applies: spatial dimensions are rounded to the nearest multiple of 32 and frame count is rounded down to a multiple of 17. Videos shorter than 17 frames after conversion to H3's 24 fps are skipped rather than being treated as still images.
 
-The physical video and image microbatch sizes must both be `1`; the same applies to eval microbatch sizes when an eval dataset is unbucketed. `gradient_accumulation_steps` can still be greater than one because each sample is prepared independently before accumulation. The only data omitted is the final incomplete accumulated batch across all data-parallel ranks. Increase `num_repeats` if the complete dataset is smaller than that logical batch. NSYNC remains bucket-based and cannot be combined with this mode.
+The physical video and image microbatch sizes must both be `1`; the same applies to eval microbatch sizes when an eval dataset is unbucketed. `gradient_accumulation_steps` can still be greater than one because each sample is prepared independently before accumulation. The only data omitted is the final incomplete accumulated batch across all data-parallel ranks. Increase `num_repeats` if the complete dataset is smaller than that logical batch.
+
+NSYNC is also supported in unbucketed mode. Each positive, paired negative, and selected anchor is prepared as its own batch-size-one pass, so their spatial and temporal shapes can differ. Their LoRA gradient vectors still have identical parameter shapes for projection. NSYNC's existing data-parallel-world-size-one restriction still applies. Use [`minimax_h3_unbucketed_nsync_dataset.toml`](../examples/minimax_h3_unbucketed_nsync_dataset.toml) as the dataset template.
 
 ## NSYNC LoRA training
 
@@ -63,8 +65,8 @@ The three H3 passes are sequential, so their activation graphs do not have to co
 Use [minimax_h3_nsync_self_flow_dataset.toml](../examples/minimax_h3_nsync_self_flow_dataset.toml) as the dataset template. Important data rules:
 
 - Every directory must set `nsync_role = 'positive'` or `'negative'`, and matching directories use the same `nsync_pair`.
-- `nsync_pair` is also the group name. On a group's positive directory, optional `nsync_anchor_pairs = ['group_b', 'group_c']` draws anchors from the pooled positive examples in those groups. Every listed group must use matching bucket settings. If omitted, anchors come from the group's own positives, preserving the original behavior.
-- Positive and negative media are paired by filename stem and must land in the same resolution/frame bucket. For video, generate the negative with the same frame count and dimensions.
+- `nsync_pair` is also the group name. On a group's positive directory, optional `nsync_anchor_pairs = ['group_b', 'group_c']` draws anchors from the pooled positive examples in those groups. Every listed group must use matching dataset shape settings. If omitted, anchors come from the group's own positives, preserving the original behavior.
+- Positive and negative media are paired by filename stem. In bucketed mode they must land in the same resolution/frame bucket. Unbucketed mode prepares them independently, although matching dimensions and frame counts are still recommended for semantically comparable generated negatives.
 - The negative uses the exact positive caption. `caption_path` lets the negative directory reuse positive `.txt` files or `captions.json`.
 - The generated negative should preserve the caption's subject/content while omitting the target concept or style. The trainer does not synthesize negatives for you.
 - NSYNC currently requires data-parallel world size 1, `uncond_fraction = 0`, and no `optimizer.gradient_release`. NSYNC by itself can use pipeline parallelism.

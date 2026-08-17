@@ -1420,8 +1420,6 @@ def _validate_dataset_config(
     if unbucketed:
         if model_type != 'minimax_h3':
             errors.append(f'{description}.unbucketed is currently supported only for MiniMax H3')
-        if nsync_expected:
-            errors.append(f'{description}.unbucketed is not compatible with NSYNC')
         for key, value in physical_batch_sizes.items():
             batch_sizes = _batch_size_values(value)
             if not batch_sizes or any(batch_size != 1 for batch_size in batch_sizes):

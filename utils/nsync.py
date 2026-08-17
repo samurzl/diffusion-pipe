@@ -47,6 +47,27 @@ def build_anchor_iteration_order(source_lengths, target_length, seed):
     return result[:target_length]
 
 
+def build_unbucketed_nsync_role_order(pair_lengths, logical_batch_size, seed=0):
+    """Shuffle NSYNC examples across groups while preserving P/N/A adjacency."""
+    if logical_batch_size <= 0:
+        raise ValueError('NSYNC logical batch size must be positive')
+    if any(length < 0 for length in pair_lengths):
+        raise ValueError('NSYNC pair lengths must be non-negative')
+
+    triplets = [
+        (pair_index, occurrence_index * 3)
+        for pair_index, pair_length in enumerate(pair_lengths)
+        for occurrence_index in range(pair_length)
+    ]
+    random.Random(seed).shuffle(triplets)
+    new_length = (len(triplets) // logical_batch_size) * logical_batch_size
+    return [
+        (pair_index, role_start + role_offset)
+        for pair_index, role_start in triplets[:new_length]
+        for role_offset in range(3)
+    ]
+
+
 class NSYNCGradientController:
     """Accumulate NSYNC role gradients and apply the paper's projection update.
 

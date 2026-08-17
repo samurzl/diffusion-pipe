@@ -12,6 +12,8 @@
 #   --remove-text 'your target trigger or style' --dry-run
 # Add --mode i2v when training with model.mode = 'i2v'. The mixed image/video
 # I2V setup is shown in minimax_h3_i2v_nsync_dataset.toml.
+# For native aspect ratios/frame lengths without sparse buckets, use
+# minimax_h3_unbucketed_nsync_dataset.toml instead.
 
 resolutions = [512]
 enable_ar_bucket = true

@@ -218,7 +218,7 @@ path = {str(media_dir)!r}
         self.assertIn('model.mode must be t2v or i2v', message)
         self.assertIn('model.i2v_visual_cond_timestep must be in [0, 1]', message)
 
-    def test_minimax_h3_i2v_and_nsync_can_be_enabled_together(self):
+    def test_minimax_h3_i2v_bucketed_and_unbucketed_nsync_can_be_enabled_together(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             config_path = self._write_valid_config(root)
@@ -234,8 +234,8 @@ path = {str(media_dir)!r}
             dataset_path = root / 'dataset.toml'
             dataset_path.write_text(
                 f'''\
+unbucketed = true
 resolutions = [512]
-frame_buckets = [1, 33]
 
 [[directory]]
 path = {str(positive_dir)!r}
@@ -272,11 +272,20 @@ enabled = true
             )
 
             config, datasets = load_and_validate_config(config_path, world_size=1)
+            dataset_path.write_text(
+                dataset_path.read_text()
+                .replace('unbucketed = true\n', '')
+                .replace('resolutions = [512]\n', 'resolutions = [512]\nframe_buckets = [1, 33]\n')
+            )
+            _, bucketed_datasets = load_and_validate_config(config_path, world_size=1)
 
         self.assertEqual(config['model']['mode'], 'i2v')
         self.assertTrue(config['training_methods']['nsync']['enabled'])
         self.assertEqual(len(datasets), 1)
-        self.assertEqual(len(next(iter(datasets.values()))['directory']), 2)
+        dataset = next(iter(datasets.values()))
+        self.assertTrue(dataset['unbucketed'])
+        self.assertEqual(len(dataset['directory']), 2)
+        self.assertFalse(next(iter(bucketed_datasets.values())).get('unbucketed', False))
 
     def test_reports_multiple_errors_in_one_pass(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -523,6 +532,7 @@ enabled = true
             dataset_path = root / 'dataset.toml'
             dataset_path.write_text(
                 f'''\
+unbucketed = true
 resolutions = [512]
 
 [[directory]]

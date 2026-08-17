@@ -6,6 +6,7 @@ from utils.nsync import (
     NSYNC_POSITIVE,
     NSYNCGradientController,
     build_anchor_iteration_order,
+    build_unbucketed_nsync_role_order,
 )
 
 
@@ -17,6 +18,19 @@ def test_anchor_iteration_order_is_deterministic_across_groups():
     assert len(first) == 8
     assert set(first[:5]) == {(0, 0), (0, 1), (1, 0), (1, 1), (1, 2)}
     assert all(source_index in (0, 1) for source_index, _ in first)
+
+
+def test_unbucketed_nsync_role_order_preserves_triplets_and_truncates_globally():
+    order = build_unbucketed_nsync_role_order([2, 3], logical_batch_size=2, seed=1234)
+
+    assert len(order) == 12
+    triplets = [order[index:index + 3] for index in range(0, len(order), 3)]
+    assert all(
+        first[0] == second[0] == third[0]
+        and (first[1], second[1], third[1]) == (first[1], first[1] + 1, first[1] + 2)
+        for first, second, third in triplets
+    )
+    assert build_unbucketed_nsync_role_order([1, 1], logical_batch_size=3) == []
 
 
 def _backward_role(controller, parameters, gradients, role):
