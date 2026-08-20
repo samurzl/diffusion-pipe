@@ -291,6 +291,15 @@ def set_config_defaults(config):
     if 'adapter' in config:
         adapter_config = config['adapter']
         adapter_type = adapter_config['type']
+        if adapter_type == 'lora' and (init_from_existing := adapter_config.get('init_from_existing')):
+            checkpoint_rank = common.infer_lora_rank(init_from_existing)
+            configured_rank = adapter_config.get('rank')
+            if configured_rank != checkpoint_rank:
+                print(
+                    f'Using LoRA rank {checkpoint_rank} from {init_from_existing} '
+                    f'instead of configured rank {configured_rank}'
+                )
+            adapter_config['rank'] = checkpoint_rank
         if 'alpha' in adapter_config:
             raise NotImplementedError(
                 'This script forces alpha=rank to make the saved adapter format simpler and more predictable with downstream inference programs. Please remove alpha from the config.'

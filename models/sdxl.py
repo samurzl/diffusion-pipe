@@ -11,7 +11,7 @@ import safetensors
 from safetensors.torch import save_file
 
 from models.base import BasePipeline, make_contiguous
-from utils.common import AUTOCAST_DTYPE, is_main_process
+from utils.common import AUTOCAST_DTYPE, is_main_process, resolve_single_safetensors
 
 
 
@@ -475,12 +475,8 @@ class SDXLPipeline(BasePipeline):
 
     def load_adapter_weights(self, adapter_path):
         print(f'Loading adapter weights from path {adapter_path}')
-        safetensors_files = list(Path(adapter_path).glob('*.safetensors'))
-        if len(safetensors_files) == 0:
-            raise RuntimeError(f'No safetensors file found in {adapter_path}')
-        if len(safetensors_files) > 1:
-            raise RuntimeError(f'Multiple safetensors files found in {adapter_path}')
-        adapter_state_dict = safetensors.torch.load_file(safetensors_files[0])
+        safetensors_file = resolve_single_safetensors(adapter_path)
+        adapter_state_dict = safetensors.torch.load_file(safetensors_file)
         self.diffusers_pipeline.load_lora_weights(adapter_state_dict, adapter_name='default')
         self._set_param_original_name()
 

@@ -73,6 +73,40 @@ def load_safetensors(path):
     return tensors
 
 
+def resolve_single_safetensors(path):
+    """Return a safetensors file from either a file or single-file directory."""
+    path = Path(path)
+    if path.is_file():
+        if path.suffix != '.safetensors':
+            raise ValueError(f'Expected {path} to be a safetensors file')
+        return path
+    safetensors_files = list(path.glob('*.safetensors'))
+    if len(safetensors_files) == 0:
+        raise RuntimeError(f'No safetensors file found in {path}')
+    if len(safetensors_files) > 1:
+        raise RuntimeError(f'Multiple safetensors files found in {path}')
+    return safetensors_files[0]
+
+
+def infer_lora_rank(path):
+    """Infer LoRA rank from tensor shapes without loading tensor data."""
+    filename = resolve_single_safetensors(path)
+    ranks = set()
+    with safe_open(str(filename), framework='pt', device='cpu') as f:
+        for key in f.keys():
+            shape = f.get_slice(key).get_shape()
+            key_lower = key.lower()
+            if ('lora_a' in key_lower or 'lora_down' in key_lower) and len(shape) >= 2:
+                ranks.add(shape[0])
+            elif ('lora_b' in key_lower or 'lora_up' in key_lower) and len(shape) >= 2:
+                ranks.add(shape[1])
+    if not ranks:
+        raise ValueError(f'Could not infer LoRA rank from {filename}: no LoRA A/B tensors found')
+    if len(ranks) != 1:
+        raise ValueError(f'Could not infer one LoRA rank from {filename}: found ranks {sorted(ranks)}')
+    return ranks.pop()
+
+
 def load_state_dict(path):
     path = str(path)
     if path.endswith('.safetensors'):

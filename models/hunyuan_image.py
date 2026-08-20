@@ -13,7 +13,7 @@ from accelerate.utils import set_module_tensor_to_device
 import transformers
 
 from models.base import BasePipeline, make_contiguous
-from utils.common import AUTOCAST_DTYPE, get_lin_function, time_shift, iterate_safetensors, is_main_process
+from utils.common import AUTOCAST_DTYPE, get_lin_function, time_shift, iterate_safetensors, is_main_process, resolve_single_safetensors
 from utils.offloading import ModelOffloader
 from models.hunyuan_image_modeling import MMDoubleStreamBlock, MMSingleStreamBlock
 from hyimage.models.vae import HunyuanVAE2D
@@ -139,12 +139,8 @@ class HunyuanImagePipeline(BasePipeline):
     def load_adapter_weights(self, adapter_path):
         if is_main_process():
             print(f'Loading adapter weights from path {adapter_path}')
-        safetensors_files = list(Path(adapter_path).glob('*.safetensors'))
-        if len(safetensors_files) == 0:
-            raise RuntimeError(f'No safetensors file found in {adapter_path}')
-        if len(safetensors_files) > 1:
-            raise RuntimeError(f'Multiple safetensors files found in {adapter_path}')
-        adapter_state_dict = safetensors.torch.load_file(safetensors_files[0])
+        safetensors_file = resolve_single_safetensors(adapter_path)
+        adapter_state_dict = safetensors.torch.load_file(safetensors_file)
         modified_state_dict = {}
         model_parameters = set(name for name, p in self.transformer.named_parameters())
         for k, v in adapter_state_dict.items():
