@@ -302,6 +302,38 @@ class CommonPipeline:
             if p.requires_grad:
                 p.data = p.data.to(adapter_config['dtype'])
 
+    @staticmethod
+    def convert_adapter_state_dict(adapter_state_dict, target_model):
+        """Convert native, Diffusers/ComfyUI, or Kohya LoRA keys to PEFT keys."""
+        model_parameters = set(name for name, _ in target_model.named_parameters())
+        kohya_key_map = {}
+        for parameter_name in model_parameters:
+            match = re.match(r'^(.*)\.lora_([AB])\.default\.weight$', parameter_name)
+            if not match:
+                continue
+            module_name, side = match.groups()
+            kohya_side = 'lora_down' if side == 'A' else 'lora_up'
+            packed_name = module_name.replace('.', '_')
+            kohya_key_map[f'lora_unet_{packed_name}.{kohya_side}.weight'] = parameter_name
+            kohya_key_map[f'{packed_name}.{kohya_side}.weight'] = parameter_name
+
+        modified_state_dict = {}
+        for original_key, value in adapter_state_dict.items():
+            # Kohya alpha entries describe inference scaling and are not PEFT parameters.
+            if original_key.endswith('.alpha'):
+                continue
+            key = re.sub(r'^(transformer|diffusion_model)\.', '', original_key)
+            key = re.sub(r'\.weight$', '.default.weight', key)
+            if key not in model_parameters:
+                key = kohya_key_map.get(original_key)
+            if key is None or key not in model_parameters:
+                raise RuntimeError(
+                    f'Adapter key {original_key} does not match this model. The checkpoint may '
+                    'target a different model architecture or unsupported LoRA format.'
+                )
+            modified_state_dict[key] = value
+        return modified_state_dict
+
         # Better init for LoKr, avoids very small starting gradients that takes a long time to recover from.
         # TODO: decide if we want to do this
         # for name, p in self.lora_model.named_parameters():
@@ -369,16 +401,7 @@ class BasePipeline(CommonPipeline):
             print(f'Loading adapter weights from path {adapter_path}')
         safetensors_file = resolve_single_safetensors(adapter_path)
         adapter_state_dict = safetensors.torch.load_file(safetensors_file)
-        modified_state_dict = {}
-        model_parameters = set(name for name, p in self.transformer.named_parameters())
-        for k, v in adapter_state_dict.items():
-            # Replace Diffusers or ComfyUI prefix
-            k = re.sub(r'^(transformer|diffusion_model)\.', '', k)
-            # Replace weight at end for LoRA format
-            k = re.sub(r'\.weight$', '.default.weight', k)
-            if k not in model_parameters:
-                raise RuntimeError(f'modified_state_dict key {k} is not in the model parameters')
-            modified_state_dict[k] = v
+        modified_state_dict = self.convert_adapter_state_dict(adapter_state_dict, self.transformer)
         self.transformer.load_state_dict(modified_state_dict, strict=False)
 
     def load_and_fuse_adapter(self, path):
@@ -707,16 +730,7 @@ class ComfyPipeline(CommonPipeline):
             print(f'Loading adapter weights from path {adapter_path}')
         safetensors_file = resolve_single_safetensors(adapter_path)
         adapter_state_dict = safetensors.torch.load_file(safetensors_file)
-        modified_state_dict = {}
-        model_parameters = set(name for name, p in self.diffusion_model.named_parameters())
-        for k, v in adapter_state_dict.items():
-            # Replace Diffusers or ComfyUI prefix
-            k = re.sub(r'^(transformer|diffusion_model)\.', '', k)
-            # Replace weight at end for LoRA format
-            k = re.sub(r'\.weight$', '.default.weight', k)
-            if k not in model_parameters:
-                raise RuntimeError(f'modified_state_dict key {k} is not in the model parameters')
-            modified_state_dict[k] = v
+        modified_state_dict = self.convert_adapter_state_dict(adapter_state_dict, self.diffusion_model)
         self.diffusion_model.load_state_dict(modified_state_dict, strict=False)
 
     def load_and_fuse_adapter(self, path):
