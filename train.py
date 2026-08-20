@@ -590,9 +590,9 @@ if __name__ == '__main__':
     torch.multiprocessing.set_sharing_strategy('file_system')
     deepspeed.utils.set_log_level_from_string('info')
     apply_patches()
+    common.AUTOCAST_DTYPE = config['model']['dtype']
     model_pipeline_class = resolve_model_pipeline(config['model']['type'])
 
-    common.AUTOCAST_DTYPE = config['model']['dtype']
     dataset_util.UNCOND_FRACTION = config.get('uncond_fraction', 0.0)
     if map_num_proc := config.get('map_num_proc', None):
         dataset_util.NUM_PROC = map_num_proc
