@@ -1925,6 +1925,10 @@ class PipelineDataLoader:
         for batch in self.dataloader:
             features, label = self.model.prepare_inputs(batch, timestep_quantile=self.eval_quantile)
             *target_list, mask = label
+            # DeepSpeed PipelineEngine requires every item in a tuple label to be
+            # a tensor. Loss functions use an empty tensor to mean "no mask".
+            if mask is None:
+                mask = target_list[0].new_empty((0,))
             # The target depends on the noise, so we must broadcast it from the first stage to the last.
             # NOTE: I had to patch the pipeline parallel TrainSchedule so that the LoadMicroBatch commands
             # would line up on the first and last stage so that this doesn't deadlock.
