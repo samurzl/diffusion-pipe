@@ -2,6 +2,8 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import json
+import struct
 from pathlib import Path
 from unittest.mock import patch
 
@@ -12,6 +14,17 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 class ConfigValidationTest(unittest.TestCase):
+    def _write_safetensors(self, path: Path) -> None:
+        header = json.dumps({
+            'layer.lora_A.weight': {
+                'dtype': 'F32',
+                'shape': [2, 4],
+                'data_offsets': [0, 32],
+            }
+        }).encode()
+        header += b' ' * ((8 - len(header) % 8) % 8)
+        path.write_bytes(struct.pack('<Q', len(header)) + header + bytes(32))
+
     def _write_valid_config(self, root: Path) -> Path:
         media_dir = root / 'media'
         model_dir = root / 'model'
@@ -472,6 +485,24 @@ control_path = {str(control_dir)!r}
                 load_and_validate_config(config_path)
 
         self.assertIn('not a readable safetensors file', str(caught.exception))
+
+    def test_adapter_init_from_existing_accepts_safetensors_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_path = self._write_valid_config(root)
+            adapter_weights = root / 'existing.safetensors'
+            self._write_safetensors(adapter_weights)
+            config_path.write_text(config_path.read_text() + f'''\
+
+[adapter]
+type = 'lora'
+rank = 8
+init_from_existing = {str(adapter_weights)!r}
+''')
+
+            config, _ = load_and_validate_config(config_path)
+
+        self.assertEqual(config['adapter']['init_from_existing'], str(adapter_weights))
 
     def test_nsync_pairing_is_checked_during_preflight(self):
         with tempfile.TemporaryDirectory() as tmp:

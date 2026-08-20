@@ -1033,9 +1033,18 @@ def _validate_main_config(
                         or adapter_path.startswith(('./', '../', '~/'))
                     )
                     if explicitly_local and expanded.exists():
-                        if not expanded.is_dir():
-                            errors.append('adapter.init_from_existing must be an adapter directory')
-                        else:
+                        if expanded.is_file():
+                            if expanded.suffix != '.safetensors':
+                                errors.append(
+                                    'adapter.init_from_existing file must have a .safetensors extension'
+                                )
+                            else:
+                                _validate_safetensors_header(
+                                    expanded,
+                                    'adapter.init_from_existing weights',
+                                    errors,
+                                )
+                        elif expanded.is_dir():
                             weights = list(expanded.glob('*.safetensors'))
                             if len(weights) != 1:
                                 errors.append(
@@ -1048,6 +1057,10 @@ def _validate_main_config(
                                     'adapter.init_from_existing weights',
                                     errors,
                                 )
+                        else:
+                            errors.append(
+                                'adapter.init_from_existing must be an adapter directory or .safetensors file'
+                            )
 
     optimizer_config = config.get('optimizer')
     if not isinstance(optimizer_config, dict):
