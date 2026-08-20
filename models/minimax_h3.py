@@ -1169,14 +1169,16 @@ class InitialLayer(nn.Module):
             raise ValueError(f'Unknown MiniMax H3 packing mode: {mode}')
 
         img_update = layout.img_update.to(device)
-        video_rows = patchify_video(video_x.to(torch.float32), self.patch_size)
+        # Autocast may convert patchify_video's output back to the model dtype,
+        # so cast the resulting rows before assigning them into the FP32 buffer.
+        video_rows = patchify_video(video_x.to(torch.float32), self.patch_size).to(torch.float32)
         audio_rows = pack_audio(audio_x.to(torch.float32))
 
         all_video_rows = video_rows
         if has_visual_condition:
             cond_video_rows = patchify_video(
                 first_frame_latents.to(device=device, dtype=torch.float32), self.patch_size
-            )
+            ).to(torch.float32)
             all_video_rows = torch.empty(img_update.shape[0], video_rows.shape[1], dtype=torch.float32, device=device)
             all_video_rows[~img_update] = cond_video_rows
             all_video_rows[img_update] = video_rows
